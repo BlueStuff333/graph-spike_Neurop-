@@ -42,8 +42,8 @@ for input_strength = input_strength_list
         for idx_rpt = 1:num_rpt
     
             %% input mask
-            Ne_in = 0.36*Ne; 
-            Ni_in = 0.36*Ni;
+            Ne_in = ceil(0.36*Ne); 
+            Ni_in = ceil(0.36*Ni);
             [mask_E, mask_I] = InputMask_random(e_locs, i_locs,Ne_in, Ni_in);
             
             %% lognormal input

@@ -1,19 +1,19 @@
-% credit to ruocheny for multifractal generator code
-% credit to 
 clear all; close all; clc;
 
-batchstamp = string(datetime('now'));
+batchstamp = string(datetime('now'), "dd-MMM-yyyy_HH:mm:ss");
 batchdir = fullfile('networks', batchstamp);
 mkdir(batchdir);
 
 %% parameters
-n_graphs = 100; % num graphs to make
-n = 500; % num neurons to generate
+n_graphs = 1; % num graphs to make
+n = 50; % num neurons to generate
 r = 0.8; % proportion of neurons that are E
 Ne = floor(0.8*n); Ni = n-Ne;
 i_scaling = 3; % how much stronger than excitation we want inhibition to be
 % multifractal parameters
-P = [0.8,0.5;0.5,0.4];
+% P = [0.8,0.5;0.5,0.4]; % default
+% P = [0.9 0.05 ; 0.05 0.9]; % strong
+P = [0.5, 0.5; 0.5, 0.5]; % weak
 L = [0.7,0.3];
 M = length(L); K = 3;
 isDirected = 1; isBinary = 0;
@@ -27,9 +27,9 @@ for i = 1:n_graphs
     [LK, LKcum] = calcLK(M, K, idx, L);
     [adj] = generateNetworkMF(PK, LK, LKcum, n, isDirected, isBinary);
     
-    % % display the graph
-    % G = digraph(adj);
-    % plot(G);
+    % display the graph
+    G = digraph(adj);
+    plot(G);
     % % display graph statistics
     % fprintf('Connections per neuron: %.1f\n', nnz(adj)/n);
     % fprintf('Density: %.4f\n', nnz(adj)/n^2);

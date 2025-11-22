@@ -1,1 +1,2 @@
 Neurop-generation/__pycache__/*
+graph-spike-generation/networks/**/*.mat
