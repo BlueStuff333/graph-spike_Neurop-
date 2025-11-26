@@ -16,6 +16,9 @@ P = [
     0.8,0.5;
     0.5,0.4
     ]; % p_ij(r) matrix
+% Resolution # TODO it's just the length of P, for now duplicating P
+R = 3;
+P = repmat(P, 1, 1, R);
 % randomize side length
 l1 = rand();
 L = [l1, 1-l1];
@@ -33,9 +36,12 @@ n_zeros = ceil(log10(n_graphs));
 for i = 1:n_graphs
     % generate the graph
     idx = calcIdx(M, K);
-    PK = calcPK(M, K, idx, P);
+    
+    PK = calcPK_weighted(M, K, idx, P);
+    % PK = calcPK(M, K, idx, P);
     [LK, LKcum] = calcLK(M, K, idx, L);
-    [adj] = generateNetworkMF(PK, LK, LKcum, n, isDirected, isBinary);
+    % [adj] = generateNetworkMF(PK, LK, LKcum, n, isDirected, isBinary);
+    [adj] = generateNetworkWMGM(PK, LK, LKcum, n, isDirected, isBinary);
 
     % decide which neurons are e and i
     idx = randperm(n, Ni);
@@ -52,13 +58,13 @@ for i = 1:n_graphs
     filepath = fullfile(batchdir, filename);
     save(filepath, 'adj', 'e_locs', 'i_locs', 'firings');
     
-    % create & save jpg of the graph
-    plotname = sprintf('graph_%d', i);
-    plotsdir = fullfile(batchdir, 'plots'); mkdir (plotsdir);
-    node_colors = saveCliqueColors(adj, plotsdir, plotname);
-    % save the rasters in a jpg
-    raster_dir = fullfile(batchdir, 'rasters'); mkdir(raster_dir);
-    saveRasterPlots(firings, node_colors, raster_dir);
+    % % create & save jpg of the graph
+    % plotname = sprintf('graph_%d', i);
+    % plotsdir = fullfile(batchdir, 'plots'); mkdir (plotsdir);
+    % node_colors = saveCliqueColors(adj, plotsdir, plotname);
+    % % save the rasters in a jpg
+    % raster_dir = fullfile(batchdir, 'rasters'); mkdir(raster_dir);
+    % saveRasterPlots(firings, node_colors, raster_dir);
 
     clc; disp(num2str(i));
 end
