@@ -11,13 +11,15 @@ r = 0.8; % proportion of neurons that are E
 Ne = floor(0.8*n); Ni = n-Ne;
 i_scaling = 3; % how much stronger than excitation we want inhibition to be
 
-% multifractal parameters
+%% multifractal parameters
 P = [
     0.8,0.5;
     0.5,0.4
     ]; % p_ij(r) matrix
-L = [0.7,0.3]; % side lengths
-M = length(L); K = 3;
+% randomize side length
+l1 = rand();
+L = [l1, 1-l1];
+M = length(L); K = randi([1,5]);
 isDirected = 1; isBinary = 0;
 
 %% Randomized parameter sets of the following forms:
