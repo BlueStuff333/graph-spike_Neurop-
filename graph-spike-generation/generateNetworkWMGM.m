@@ -24,10 +24,14 @@ else
 end
 
 %% gen nodes
-for i = 1:N
-    tmpNode = rand;
-    class(i) = find(tmpNode <= LKcum, 1);
-end
+% for i = 1:N
+%     tmpNode = rand;
+%     class(i) = find(tmpNode <= LKcum, 1);
+% end
+u = rand(N, 1);         % N random uniforms
+% LKcum is Q×1, we want thresholds: [0, LKcum(1), LKcum(2), ... ,1]
+edges = [0; LKcum(:)];
+[~, class] = histc(u, edges);
 
 %% build cdf for edge weights
 
