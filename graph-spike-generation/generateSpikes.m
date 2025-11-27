@@ -5,7 +5,7 @@ Ni = sum(i_locs);
 n = Ne + Ni;
 
 %% params for firing model
-T = 50000; input_type = "lognormal";
+T = 10000; input_type = "lognormal";
 input_strength_list = [10000];
 noise_scalar_list = [0.6];
 input_strength_scalar_E = 5; input_strength_scalar_I = 2;
