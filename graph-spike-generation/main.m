@@ -20,11 +20,12 @@ mkdir(fullfile('networks', batchstamp, 'test'));
 % K = 5, M = 2, R = 3, l_i [(0.1, 0.9), (0.3, 0.7), (0.5, 0.5), (0.7, 0.3), (0.9, 0.1)], p_ij(r) same
 % R = 1:4
 %% generate n graph-spiking pairs
-n_graphs = 10^6; % num graphs to make
+n_graphs = 10000; % num graphs to make
 train_test = 0.8;
 n_zeros = ceil(log10(n_graphs));
-adj_lists = cell(n_graphs, 1);
-firings_list = cell(n_graphs, 1);
+isDirected = 1; isBinary = 0;
+% adj_lists = cell(n_graphs, 1);    % These cause memory issues for large n_graphs
+% firings_list = cell(n_graphs, 1); % TODO develop a separate pipeline for visualization from saved .mat files
 tic
 parfor i = 1:n_graphs
     % randomize parameters
@@ -45,23 +46,21 @@ parfor i = 1:n_graphs
     l1 = rand();
     L = [l1, 1-l1];
     M = length(L); K = randi([1,5]);
-    isDirected = 1; isBinary = 0;
-
 
     % generate the graph
     PK = calcPK_weighted(M, K, P);
     [LK, LKcum] = calcLK(M, K, L);
-    adj_lists{i} = generateNetworkWMGM(PK, LK, LKcum, n, isDirected, isBinary);
+    [adj] = generateNetworkWMGM(PK, LK, LKcum, n, isDirected, isBinary);
 
     % decide which neurons are e and i
     idx = randperm(n, Ni);
     i_locs = zeros(n, 1);
     i_locs(idx) = 1;
     e_locs = ones(n,1) - i_locs;
-    adj_lists{i}(:,logical(i_locs)) = -1 * i_scaling * adj_lists{i}(:,logical(i_locs));
+    adj(:,logical(i_locs)) = -1 * i_scaling * adj(:,logical(i_locs));
 
     % generate the spikes
-    [firings_list{i}, stl, y] = generateSpikes(adj_lists{i}, e_locs, i_locs);
+    [firings, stl, y] = generateSpikes(adj, e_locs, i_locs);
 
     % save the graph and its spikes in a .mat file
     filename = sprintf(['graph-spike_%0', num2str(n_zeros), 'd.mat'], i);
@@ -71,8 +70,11 @@ parfor i = 1:n_graphs
         out_path = fullfile(batchdir, 'test', filename);
     end
     
-    S = struct('adj', adj_lists{i}, 'e_locs', e_locs, 'i_locs', i_locs, 'firings', firings_list{i});
+    S = struct('adj', adj, 'e_locs', e_locs, 'i_locs', i_locs, 'firings', firings);
     save(out_path, '-fromstruct', S);
+
+    % free memory
+    adj = []; firings = []; e_locs = []; i_locs = [];
 
     %clc; 
     disp(num2str(i));

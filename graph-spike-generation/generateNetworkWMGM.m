@@ -1,5 +1,5 @@
 function [adj] = generateNetworkWMGM(PK, LK, LKcum, N, isDirected, isBinary)
-% generateNetworkMF  Generate (weighted) multifractal network.
+% generateNetworkWMGM  Generate (weighted) multifractal network.
 %
 %   PK : Q x Q          (MF)  linking parameter per class pair
 %        Q x Q x R      (WMGM)  probability per weight level r=1..R
