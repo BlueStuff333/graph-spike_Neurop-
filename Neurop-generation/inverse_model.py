@@ -30,6 +30,8 @@ class RasterToGraphMWT(nn.Module):
         k: Number of polynomial bases (default: 4)
         base: Polynomial basis ('legendre' or 'chebyshev')
         predict_positions: Whether to also predict neuron positions
+        param_dim: Dimension of additional WMGM params (if any). If using randomized parameters, 
+                   set this to the size of the largest possible parameter vector.
     """
     
     def __init__(
@@ -43,7 +45,8 @@ class RasterToGraphMWT(nn.Module):
         mwt_levels=4,
         k=4,
         base='legendre',
-        predict_positions=False
+        predict_positions=False,
+        param_dim=None
     ):
         super().__init__()
         
@@ -79,6 +82,17 @@ class RasterToGraphMWT(nn.Module):
             n_neurons=n_neurons,
             hidden_dim=256
         )
+
+        # 4 (Optional) Parameter Decoder - Predict WMGM params
+        if param_dim is not None:
+            self.param_dim = param_dim
+            self.param_decoder = nn.Sequential(
+                nn.Linear(embedding_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, self.param_dim)
+            )
         
     def forward(self, raster, positions=None):
         """
@@ -111,13 +125,20 @@ class RasterToGraphMWT(nn.Module):
         # adjacency: [batch, n_neurons, n_neurons] binary connectivity
         # weights: [batch, n_neurons, n_neurons] connection strengths
         
-        return {
+        out = {
             'adjacency': adjacency,
             'positions': positions,
             'weights': weights,
             'embeddings': node_embeddings
         }
 
+        if self.param_dim is not None:
+            # mean pooling over neurons
+            pooeld = node_embeddings.mean(dim=1)  # [batch, embedding_dim]
+            params = self.param_decoder(pooeld)   # [batch, param_dim]
+            out['wmgm_params'] = params
+
+        return out
 
 class TemporalMWTEncoder(nn.Module):
     """

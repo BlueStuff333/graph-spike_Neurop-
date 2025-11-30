@@ -28,15 +28,18 @@ class GraphReconstructionLoss(nn.Module):
         bce_weight=1.0,
         weight_weight=0.5,
         sparsity_weight=0.1,
-        target_sparsity=0.95
+        target_sparsity=0.80,
+        param_weight=0.0
     ):
         super().__init__()
         self.bce_weight = bce_weight
         self.weight_weight = weight_weight
         self.sparsity_weight = sparsity_weight
         self.target_sparsity = target_sparsity
-        
-        self.bce = nn.BCELoss(reduction='mean')
+        self.param_weight = param_weight
+
+        # per-element BCE loss and standard MSE loss
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
         self.mse = nn.MSELoss(reduction='mean')
     
     def forward(self, pred, target):
@@ -51,34 +54,60 @@ class GraphReconstructionLoss(nn.Module):
         losses = {}
         
         # 1. Binary connectivity loss
-        adj_loss = self.bce(pred['adjacency'], target['adjacency'])
-        losses['adjacency'] = adj_loss.item()
+        bce_raw = self.bce(pred['adjacency'], target['adjacency'])
         
+        # estimate positive fractions in this batch
+        with torch.no_grad():
+            pos_frac = target['adjacency'].mean().clamp(min=1e-4, max=1-1e-4)
+            # approx inverse-frequency weighting
+            pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
+
+        weights = torch.ones_like(bce_raw)
+        weights[target['adjacency'] ==1] = pos_weight
+        
+        adj_loss = (bce_raw * weights).mean()
+        losses['adjacency'] = adj_loss.item()
+
         # 2. Weight loss (only for existing connections)
-        if 'weights' in target:
-            mask = target['adjacency'] > 0.5  # Only existing edges
-            if mask.sum() > 0:
-                weight_loss = self.mse(
-                    pred['weights'][mask],
-                    target['weights'][mask]
-                )
-            else:
-                weight_loss = torch.tensor(0.0, device=pred['weights'].device)
-            losses['weights'] = weight_loss.item()
-        else:
-            weight_loss = torch.tensor(0.0)
-            losses['weights'] = 0.0
+        # if 'weights' in target:
+        #     mask = target['adjacency'] > 0.5  # Only existing edges
+        #     if mask.sum() > 0:
+        #         weight_loss = self.mse(
+        #             pred['weights'][mask],
+        #             target['weights'][mask]
+        #         )
+        #     else:
+        #         weight_loss = torch.tensor(0.0, device=pred['weights'].device)
+        #     losses['weights'] = weight_loss.item()
+        # else:
+        #     weight_loss = torch.tensor(0.0)
+        #     losses['weights'] = 0.0
+        # TODO remove debug
+        weight_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        losses['weights'] = 0.0
         
         # 3. Sparsity regularization (encourage sparse graphs)
         current_sparsity = 1 - pred['adjacency'].mean()
         sparsity_loss = (current_sparsity - self.target_sparsity) ** 2
         losses['sparsity'] = sparsity_loss.item()
+
+        # 4. Optional: WMGM parameter loss
+        # if 'wmgm_params' in pred and 'wmgm_params' in target:
+        #     param_loss = self.mse(pred['wmgm_params'], target['wmgm_params'])
+        #     losses['params'] = param_loss.item()
+        # else:
+        #     param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        #     losses['params'] = 0.0
+        # TODO remove debug
+        param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        losses['params'] = 0.0
         
         # Total loss
         total_loss = (
             self.bce_weight * adj_loss +
             self.weight_weight * weight_loss +
-            self.sparsity_weight * sparsity_loss
+            self.sparsity_weight * sparsity_loss +
+            self.param_weight * param_loss
         )
         
         losses['total'] = total_loss.item()
@@ -86,9 +115,14 @@ class GraphReconstructionLoss(nn.Module):
         return total_loss, losses
 
 
-def compute_metrics(pred_adj, true_adj, threshold=0.5):
+def compute_metrics(pred_adj, true_adj, threshold=0.2):
     """Compute graph reconstruction metrics"""
-    
+    device = pred_adj.device
+    true_adj = true_adj.to(device)
+
+    assert pred_adj.shape == true_adj.shape, \
+        f"Shape mismatch: pred={pred_adj.shape}, true={true_adj.shape}"
+
     # Threshold predictions
     pred_binary = (pred_adj > threshold).float()
     true_binary = true_adj
@@ -132,15 +166,19 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
         # Forward pass (raster → graph)
         optimizer.zero_grad()
         output = model(raster, positions)
+        logits = output['adjacency']
         
         # Prepare target
         # Extract true weights from adjacency if available
-        true_adj_binary = (true_adjacency != 0).float()
+        true_adj_binary = (true_adjacency != 0).float()        
 
         target = {
             'adjacency': true_adj_binary,       # for BCE
             'weights': true_adjacency.clone()   # keep full signed weights for MSE
         }
+
+        if 'wmgm_params' in graph_data:
+            target['wmgm_params'] = graph_data['wmgm_params'].to(device)
         
         # Compute loss
         loss, loss_dict = criterion(output, target)
@@ -151,10 +189,11 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
         optimizer.step()
         
         # Compute metrics
+        probs = torch.sigmoid(logits)
         metrics = compute_metrics(
-            output['adjacency'].detach(),
+            probs.detach(),
             true_adjacency,
-            threshold=0.5
+            threshold=0.2
         )
         all_metrics.append(metrics)
         
@@ -162,9 +201,15 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
         total_loss += loss.item()
         
         # Update progress bar
+        # debug: checking sparsity
+        with torch.no_grad():
+            pos_frac_true = true_adj_binary.mean().item()
+            pos_frac_pred = output['adjacency'].mean().item()
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'f1': f'{metrics["f1"]:.3f}'
+            'f1': f'{metrics["f1"]:.3f}',
+            'pos_true': f'{pos_frac_true:.4f}',
+            'pos_pred': f'{pos_frac_pred:.4f}',
         })
     
     # Average metrics
@@ -196,6 +241,7 @@ def validate(model, val_loader, criterion, device, epoch):
             
             # Forward pass
             output = model(raster, positions)
+            logits = output['adjacency']
             
             # Prepare target
             true_adj_binary = (true_adjacency != 0).float()
@@ -204,19 +250,28 @@ def validate(model, val_loader, criterion, device, epoch):
                 'adjacency': true_adj_binary,
                 'weights': true_adjacency.clone()
             }
+            if 'wmgm_params' in graph_data:
+                target['wmgm_params'] = graph_data['wmgm_params'].to(device)
             
             # Compute loss
             loss, loss_dict = criterion(output, target)
-            
+            total_loss += loss.item()
+
             # Compute metrics
+            probs = torch.sigmoid(graph_data['adjacency'].detach())
             metrics = compute_metrics(
-                output['adjacency'],
+                probs.detach(),
                 true_adjacency,
-                threshold=0.5
+                threshold=0.2
             )
             all_metrics.append(metrics)
-            
-            total_loss += loss.item()
+
+            # TODO optional debug
+            # print(
+            #     f"[Val debug] prob_min={probs.min().item():.3f}, "
+            #     f"prob_max={probs.max().item():.3f}, "
+            #     f"prob_mean={probs.mean().item():.3f}"
+            # )
             
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
@@ -259,7 +314,8 @@ def main(args):
         mwt_levels=args.mwt_levels,
         k=args.k,
         base=args.base,
-        predict_positions=args.predict_positions
+        predict_positions=args.predict_positions,
+        param_dim=args.param_dim
     )
     model = model.to(device)
     
@@ -300,10 +356,11 @@ def main(args):
     
     # Loss function
     criterion = GraphReconstructionLoss(
-        bce_weight=1.0,
-        weight_weight=0.5,
-        sparsity_weight=0.1,
-        target_sparsity=0.95  # Expect 95% sparse graphs
+        bce_weight=args.bce_weight,
+        weight_weight=args.weight_weight,
+        sparsity_weight=args.sparsity_weight,
+        target_sparsity=args.target_sparsity,
+        param_weight=args.param_weight
     )
     
     # Training loop
@@ -399,6 +456,18 @@ if __name__ == "__main__":
     parser.add_argument('--base', type=str, default='legendre')
     parser.add_argument('--predict_positions', action='store_true',
                         help='Also predict neuron positions')
+    parser.add_argument('--bce_weight', type=float, default=1.0,
+                        help='Weight for BCE loss term')
+    parser.add_argument('--weight_weight', type=float, default=0.5,
+                        help='Weight for weight MSE loss term')
+    parser.add_argument('--sparsity_weight', type=float, default=0.1,
+                        help='Weight for sparsity loss term')
+    parser.add_argument('--target_sparsity', type=float, default=0.95,
+                        help='Target sparsity level for predicted graphs')
+    parser.add_argument('--param_dim', type=int, default=0,
+                        help='Max dimension of WMGM params, if any [2x2xMAX_R]')
+    parser.add_argument('--param_weight', type=float, default=0.0,
+                        help='Weight for WMGM parameter loss term')
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=1)

@@ -69,10 +69,38 @@ class RasterGraphDataset(Dataset):
             coords = np.stack([xs.ravel(), ys.ravel()], axis=-1)
             positions = coords[:N].astype(np.float32)
 
+        # WMGM parameters, if available
+        wmgm_params = None
+        if all(k in mat for k in ["P", "L", "M", "K", "R"]):
+            MAX_R = 2 # adjust as needed, set to the same (or greater) value as the max in your data generation
+
+            P = np.asarray(mat["P"], dtype=np.float32)  # (2, 2, R)
+            # Ensure P is always 3D: (2, 2, R)
+            if P.ndim == 2:
+                # treat as R = 1
+                P = P[:, :, None]  # shape (2, 2, 1)
+            L = np.asarray(mat["L"], dtype=np.float32).ravel()  # (2,)
+            M_val = int(np.asarray(mat["M"]).squeeze()) # TODO does this need to be float32?
+            K_val = int(np.asarray(mat["K"]).squeeze())
+            R_val = int(np.asarray(mat["R"]).squeeze())
+
+            # Pad P to (2, 2, MAX_R)
+            P_fixed = np.zeros((2, 2, MAX_R), dtype=np.float32)
+            R_clamped = min(P.shape[-1], MAX_R)
+            P_fixed [:, :, :R_clamped] = P[:, :, :R_clamped]
+
+            p_flat = P_fixed.flatten() # 4 * max_R
+            extra = np.array([M_val, K_val, R_val], dtype=np.float32)  # 3,
+
+            params_vec = np.concatenate([p_flat, L, extra]) # (4*max_R + 2 + 3,)
+
+            wmgm_params = torch.from_numpy(params_vec) # TODO does this need to have .float() at the end?
+            
+
         # --- spikes → raster ---
-        # You’ll need to adapt this part based on how 'firings' is stored.
-        # Common pattern from Izhikevich’s code, etc. is an array of shape
-        # (num_spikes, 2): [t, neuron_idx]. If that's your case:
+        # 'firings' is stored using a common pattern from Izhikevich’s code, 
+        # it is an array of shape
+        # (num_spikes, 2): [t, neuron_idx].
         #
         #   firings[k, 0] = time index (1-based)
         #   firings[k, 1] = neuron index (1-based)
@@ -131,6 +159,8 @@ class RasterGraphDataset(Dataset):
             "adjacency": torch.from_numpy(adj),       # (N, N)
             "positions": torch.from_numpy(positions), # (N, 2) or (N, d)
         }
+        if wmgm_params is not None:
+            graph_data["wmgm_params"] = wmgm_params  # (4*max_R + 2 + 3,)
         raster = torch.from_numpy(raster).transpose(0, 1)  # (N, T) or (T, N) depending on your model
         # If your model expects (batch, channels, T, N), reshape in collate or in model
 
