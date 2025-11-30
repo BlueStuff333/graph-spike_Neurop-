@@ -8,6 +8,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from numpy.polynomial import chebyshev as cheb_poly
+from numpy.polynomial import legendre as leg_poly
+
 from scipy import linalg
 from scipy.special import eval_legendre, eval_chebyt
 
@@ -20,7 +23,7 @@ def compute_legendre_filters(k: int):
         k: Number of polynomial basis functions (degree k-1)
     
     Returns:
-        H0, H1, G0, G1: Decomposition filters (k×k each)
+        H0, H1, G0, G1: Decomposition filters (k*k each)
         Sigma0, Sigma1: Correction terms for reconstruction
     """
     # Legendre polynomials are orthonormal w.r.t. uniform measure on [-1, 1]
@@ -41,7 +44,6 @@ def compute_legendre_filters(k: int):
     
     # Compute inner products <φ_i(x), φ_j(2x)> and <φ_i(x), φ_j(2x-1)>
     # Using Gauss-Legendre quadrature
-    from numpy.polynomial import legendre as leg_poly
     
     # Integration points
     n_quad = max(2*k, 20)
@@ -107,7 +109,6 @@ def compute_chebyshev_filters(k: int):
     # Simplified version - full implementation in MWT repo
     # Use Chebyshev-Gauss quadrature
     
-    from numpy.polynomial import chebyshev as cheb_poly
     n_quad = max(2*k, 20)
     x_quad, w_quad = cheb_poly.chebgauss(n_quad)
     x_quad = (x_quad + 1) / 2  # [0, 1]
