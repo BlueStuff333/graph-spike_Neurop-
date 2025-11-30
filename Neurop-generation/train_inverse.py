@@ -258,7 +258,7 @@ def validate(model, val_loader, criterion, device, epoch):
             total_loss += loss.item()
 
             # Compute metrics
-            probs = torch.sigmoid(graph_data['adjacency'].detach())
+            probs = torch.sigmoid(logits)
             metrics = compute_metrics(
                 probs.detach(),
                 true_adjacency,
