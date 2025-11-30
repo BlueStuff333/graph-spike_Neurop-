@@ -389,7 +389,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_neurons', type=int, default=1125)
     parser.add_argument('--n_e', type=int, default=900)
     parser.add_argument('--n_i', type=int, default=225)
-    parser.add_argument('--n_timesteps_full', type=int, default=50000)
+    parser.add_argument('--n_timesteps_full', type=int, default=10000)
     parser.add_argument('--temporal_downsampling', type=int, default=50)
     parser.add_argument('--n_timesteps', type=int, default=1000)  # After downsampling
     parser.add_argument('--embedding_dim', type=int, default=64)
