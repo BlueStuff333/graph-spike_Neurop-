@@ -23,8 +23,6 @@ class RasterGraphDataset(Dataset):
         self,
         data_dir,
         n_neurons,
-        n_e,
-        n_i,
         n_timesteps,
         temporal_downsampling,
         MAX_R,
@@ -32,8 +30,6 @@ class RasterGraphDataset(Dataset):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.n_neurons = n_neurons
-        self.n_e = n_e
-        self.n_i = n_i
         self.n_timesteps = n_timesteps
         self.temporal_downsampling = temporal_downsampling
         self.MAX_R = MAX_R
@@ -56,9 +52,13 @@ class RasterGraphDataset(Dataset):
         adj = mat["adj"]  # shape (N, N)
         adj = np.asarray(adj, dtype=np.float32)
 
-        # --- positions (if available) ---
-        if "positions" in mat:
-            positions = np.asarray(mat["positions"], dtype=np.float32)
+        # --- positions of excitatory and inhibitory neurons (e_locs, i_locs) ---
+        if "e_locs" in mat and "i_locs" in mat:
+            e_mask = np.asarray(mat["e_locs"], dtype=np.float32).reshape(-1)  # (n,)
+            i_mask = np.asarray(mat["i_locs"], dtype=np.float32).reshape(-1)  # (n,)
+
+            # Combine into a 2-channel one-hot
+            positions = np.stack([e_mask, i_mask], axis=-1).astype(np.float32)  # (n, 2)
         else:
             # dummy positions on a unit square grid if you don't have them yet
             # (N, 2)
