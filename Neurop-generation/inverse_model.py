@@ -6,9 +6,128 @@ Predicts neural connectivity from observed spiking patterns
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 import numpy as np
 
 from mwt_layers import MWTDecompose, MWTReconstruct
+
+class MWTOperator1D(nn.Module):
+    """
+    1D Multiwavelet Neural Operator along the temporal dimension.
+
+    This is an implementation of the multiwavelet
+    architecture from Bogdan et al. (2021):
+
+        1. Repeated multiwavelet decomposition s^{n+1} -> (s^n, d^n)
+        2. Shared kernel networks A, B, C, T_bar across scales
+        3. Reconstruction from coarsest scale back to finest scale
+
+    Shapes (time domain):
+        Input:  s_fine  \in R^{B x N x k x 2^J}
+        Output: s_out   \in R^{B x N x k x 2^J}
+
+    Here:
+        B = batch size
+        N = number of neurons (spatial locations)
+        k = multiwavelet polynomial order
+        2^J = number of temporal coefficients (we crop to a power of 2).
+    """
+    def __init__(self, k: int, basis: str = "legendre", L: int = 0):
+        """
+        Args:
+            k:     Multiwavelet polynomial order (number of basis functions).
+            basis: 'legendre' or 'chebyshev'.
+            L:     Coarsest scale to keep (0 <= L < J). The number of
+                   decomposition steps is J - L for an input with 2^J points.
+        """
+        super().__init__()
+        self.k = k
+        self.L = L
+
+        # Fixed multiwavelet decomposition / reconstruction operators
+        self.decompose = MWTDecompose(k=k, basis=basis)
+        self.reconstruct = MWTReconstruct(k=k, basis=basis)
+
+        # Shared kernel networks (same at every scale)
+        # They act on the basis dimension k and along time.
+        self.A = nn.Conv1d(k, k, kernel_size=1)
+        self.B = nn.Conv1d(k, k, kernel_size=1)
+        self.C = nn.Conv1d(k, k, kernel_size=1)
+        self.T_bar = nn.Conv1d(k, k, kernel_size=1)
+
+    def _apply_conv(self, conv: nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply a Conv1d with in/out channels = k to a tensor of shape
+        (B, N, k, T) and return the same shape.
+        """
+        B, N, k, T = x.shape
+        assert k == self.k, f"Expected k={self.k}, got {k}"
+
+        # Merge batch and spatial dims → (B*N, k, T)
+        x_flat = x.reshape(B * N, k, T)
+        y_flat = conv(x_flat)
+        # Back to (B, N, k, T)
+        y = y_flat.reshape(B, N, self.k, T)
+        return y
+
+    def forward(self, s_fine: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            s_fine: (B, N, k, T) temporal functions at the finest scale.
+                    T does not need to be an exact power of 2; we crop
+                    to the largest power of 2 <= T.
+
+        Returns:
+            s_out:  (B, N, k, T_eff) transformed functions, where
+                    T_eff is the cropped power-of-two length.
+        """
+        B, N, k, T = s_fine.shape
+        assert k == self.k, f"Expected k={self.k}, got {k}"
+
+        # Ensure T is a power of two by cropping if necessary
+        if T & (T - 1) != 0:
+            # Largest power of two less than or equal to T
+            T_pow2 = 1 << (T.bit_length() - 1)
+            s_fine = s_fine[..., :T_pow2]
+            T = T_pow2
+
+        # Number of scales J so that T = 2^J
+        J = int(math.log2(T))
+        if self.L >= J:
+            # Nothing to decompose; just apply T_bar at this single scale.
+            s_hat = self._apply_conv(self.T_bar, s_fine)
+            return s_hat
+
+        # === Decomposition ===
+        s = s_fine
+        s_scales = []   # s^n for n = J-1, ..., L
+        d_scales = []   # d^n for n = J-1, ..., L
+
+        for level in range(J - 1, self.L - 1, -1):
+            # s: (B, N, k, 2^(level+1))
+            s_coarse, d_coarse = self.decompose(s)
+            s_scales.append(s_coarse)
+            d_scales.append(d_coarse)
+            s = s_coarse  # Move to next coarser scale
+
+        # Coarsest scale s^L lives in `s`
+        # U_s^L = T_bar(s^L)
+        s_hat = self._apply_conv(self.T_bar, s)  # (B, N, k, 2^L)
+
+        # === Reconstruction: go from coarse to fine ===
+        # Process scales from coarse → fine: L, L+1, ..., J-1
+        # s_scales/d_scales were appended from fine→coarse, so reverse.
+        for s_coarse, d_coarse in reversed(list(zip(s_scales, d_scales))):
+            # U_d^n = A(d^n) + B(s^n)
+            Ud = self._apply_conv(self.A, d_coarse) + self._apply_conv(self.B, s_coarse)
+            # U_s^n = C(d^n)
+            Us = self._apply_conv(self.C, d_coarse)
+            # Combine coarse representation: U_s^n + (upsampled from coarser scale)
+            s_hat = s_hat + Us
+            # Reconstruct one level finer from (U_s^n, U_d^n)
+            s_hat = self.reconstruct(s_hat, Ud)
+
+        return s_hat
 
 class RasterToGraphMWT(nn.Module):
     """
@@ -84,16 +203,29 @@ class RasterToGraphMWT(nn.Module):
         )
 
         # 4 (Optional) Parameter Decoder - Predict WMGM params
-        if param_dim is not None:
+        # if param_dim is not None:
+        #     self.param_dim = param_dim
+        #     self.param_decoder = nn.Sequential(
+        #         nn.Linear(embedding_dim, 128),
+        #         nn.ReLU(),
+        #         nn.Linear(128, 64),
+        #         nn.ReLU(),
+        #         nn.Linear(64, self.param_dim)
+        #     )
+        if param_dim is not None and param_dim > 0:
             self.param_dim = param_dim
+            # Output 2 * param_dim: [mu | logvar]
             self.param_decoder = nn.Sequential(
                 nn.Linear(embedding_dim, 128),
                 nn.ReLU(),
                 nn.Linear(128, 64),
                 nn.ReLU(),
-                nn.Linear(64, self.param_dim)
+                nn.Linear(64, 2 * self.param_dim)
             )
-        
+        else:
+            self.param_dim = None
+            self.param_decoder = None
+
     def forward(self, raster, positions=None):
         """
         Forward pass: Spike Raster → Graph Structure
@@ -134,13 +266,107 @@ class RasterToGraphMWT(nn.Module):
 
         if self.param_dim is not None:
             # mean pooling over neurons
-            pooeld = node_embeddings.mean(dim=1)  # [batch, embedding_dim]
-            params = self.param_decoder(pooeld)   # [batch, param_dim]
-            out['wmgm_params'] = params
+            pooled = node_embeddings.mean(dim=1)  # [batch, embedding_dim]
+            stats = self.param_decoder(pooled)    # [batch, 2 * param_dim]
+            mu, logvar = stats.chunk(2, dim=-1)   # each [batch, param_dim]
+
+            # Reparameterization trick: sample theta ~ N(mu, diag(exp(logvar)))
+            eps = torch.randn_like(mu)
+            params_sample = mu + eps * torch.exp(0.5 * logvar)
+
+            out['wmgm_params'] = params_sample
+            out['wmgm_params_mu'] = mu
+            out['wmgm_params_logvar'] = logvar
 
         return out
 
 class TemporalMWTEncoder(nn.Module):
+    """
+    Encodes spike rasters using a multiwavelet neural operator
+    along the temporal dimension.
+
+    Pipeline:
+        raster (B, N, T)
+          -> project to multiwavelet coefficient space (k channels)
+          -> apply several MWTOperator1D layers (dec/rec across scales)
+          -> aggregate over time -> node embeddings (B, N, embedding_dim)
+    """
+    def __init__(
+        self,
+        n_neurons: int,
+        n_timesteps: int,
+        embedding_dim: int,
+        grid_size: int,          # kept for API compatibility, not used directly
+        mwt_levels: int,
+        k: int,
+        base: str = "legendre",
+        L: int = 0,
+    ):
+        super().__init__()
+        self.n_neurons = n_neurons
+        self.n_timesteps = n_timesteps
+        self.embedding_dim = embedding_dim
+        self.k = k
+        self.L = L
+
+        # Project scalar spike trains to k-channel multiwavelet input.
+        # We treat each neuron independently in time.
+        # Input to this conv: (B*N, 1, T)
+        # Output:            (B*N, k, T)
+        self.input_projection = nn.Conv1d(1, k, kernel_size=1)
+
+        # Stack of multiwavelet operator layers
+        self.mwt_layers = nn.ModuleList(
+            [MWTOperator1D(k=k, basis=base, L=L) for _ in range(mwt_levels)]
+        )
+
+        # Final projection from k-dimensional multiwavelet feature to
+        # user-specified embedding_dim for downstream graph decoding.
+        self.output_projection = nn.Linear(k, embedding_dim)
+
+    def forward(self, raster: torch.Tensor, positions=None) -> torch.Tensor:
+        """
+        Args:
+            raster:    (B, N, T) spike rasters
+            positions: (B, N, 2) optional neuron positions (ignored here;
+                       positional structure is handled by the graph decoder
+                       or separate modules).
+
+        Returns:
+            embeddings: (B, N, embedding_dim)
+        """
+        B, N, T = raster.shape
+
+        # Ensure temporal length is a power of two by cropping if necessary
+        if T & (T - 1) != 0:
+            T_pow2 = 1 << (T.bit_length() - 1)
+            raster = raster[..., :T_pow2]
+            T = T_pow2
+
+        # Flatten neurons into the batch dimension for 1D conv
+        x = raster.reshape(B * N, 1, T)  # (B*N, 1, T)
+
+        # Project to k channels
+        x = self.input_projection(x)     # (B*N, k, T)
+
+        # Restore neuron dimension and move to (B, N, k, T)
+        x = x.reshape(B, N, self.k, T)
+
+        # Apply stacked multiwavelet operator layers with residual connections
+        for layer in self.mwt_layers:
+            x = layer(x) + x
+            x = F.relu(x)
+
+        # Aggregate over time to get per-neuron features.
+        # We use simple mean pooling over the (multiwavelet) temporal axis.
+        x_mean = x.mean(dim=-1)          # (B, N, k)
+
+        # Project to embedding_dim for the graph decoder
+        embeddings = self.output_projection(x_mean)  # (B, N, embedding_dim)
+
+        return embeddings
+
+class OLD_TemporalMWTEncoder(nn.Module):
     """
     Encodes spike raster using Multiwavelet Transform
     Learns temporal patterns at multiple scales
@@ -178,7 +404,9 @@ class TemporalMWTEncoder(nn.Module):
         self.mwt_encoder = nn.Sequential(
             nn.Conv2d(embedding_dim, embedding_dim, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(embedding_dim, embedding_dim, kernel_size=3, padding=1)
+            nn.Dropout(0.1),
+            nn.Conv2d(embedding_dim, embedding_dim, kernel_size=3, padding=1),
+            nn.LayerNorm(embedding_dim),
         )
         
         # Back to neuron space
@@ -220,7 +448,9 @@ class TemporalMWTEncoder(nn.Module):
         # Shape: [batch, embedding_dim, grid_size, grid_size]
         
         # Apply MWT encoding
+        grid_res = grid
         encoded = self.mwt_encoder(grid)
+        encoded += grid_res # residual connection
         # Shape: [batch, embedding_dim, grid_size, grid_size]
         
         # Back to neuron space
@@ -431,6 +661,20 @@ class GraphDecoder(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Softplus()  # Positive weights
         )
+
+        # --------- Initialization for adjacency logits ---------
+        # Last layer of edge_mlp: Linear(hidden_dim // 2 -> 1)
+        final_edge_layer = self.edge_mlp[-1]
+        nn.init.normal_(final_edge_layer.weight, mean=0.0, std=0.01)
+        p0 = 0.15
+        bias0 = math.log(p0 / (1.0 - p0))
+        nn.init.constant_(final_edge_layer.bias, bias0)
+        # -------------------------------------------------------
+
+        # (Optional) init weight prediction linear as well
+        final_weight_linear = self.weight_mlp[2]  # the Linear before Softplus
+        nn.init.normal_(final_weight_linear.weight, mean=0.0, std=0.01)
+        nn.init.constant_(final_weight_linear.bias, 0.0)
         
     def forward(self, embeddings):
         """
@@ -467,9 +711,9 @@ class GraphDecoder(nn.Module):
         # [batch, n_neurons, n_neurons]
         
         # Binary adjacency (during inference)
-        adjacency = torch.sigmoid(edge_logits)
+        # adjacency = torch.sigmoid(edge_logits)
         
-        return adjacency, edge_weights
+        return edge_logits, edge_weights
 
 
 # Example usage

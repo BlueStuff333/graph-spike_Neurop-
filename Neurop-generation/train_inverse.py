@@ -29,7 +29,8 @@ class GraphReconstructionLoss(nn.Module):
         weight_weight=0.5,
         sparsity_weight=0.1,
         target_sparsity=0.80,
-        param_weight=0.0
+        param_weight=0.0,
+        kl_weight=1e-3,
     ):
         super().__init__()
         self.bce_weight = bce_weight
@@ -37,6 +38,7 @@ class GraphReconstructionLoss(nn.Module):
         self.sparsity_weight = sparsity_weight
         self.target_sparsity = target_sparsity
         self.param_weight = param_weight
+        self.kl_weight = kl_weight
 
         # per-element BCE loss and standard MSE loss
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
@@ -55,41 +57,49 @@ class GraphReconstructionLoss(nn.Module):
         
         # 1. Binary connectivity loss
         bce_raw = self.bce(pred['adjacency'], target['adjacency'])
+        # There are no self-connections; mask out diagonal
+        batch, n, _ = bce_raw.shape
+        eye = torch.eye(n, device=bce_raw.device).unsqueeze(0)  # [1, n, n]
+        mask = 1.0 - eye  # 0 on diag, 1 elsewhere
+
+        bce_raw = bce_raw * mask
+        target_adj = target['adjacency'] * mask
         
         # estimate positive fractions in this batch
         with torch.no_grad():
-            pos_frac = target['adjacency'].mean().clamp(min=1e-4, max=1-1e-4)
+            pos_frac = target_adj.mean().clamp(min=1e-4, max=1-1e-4)
             # approx inverse-frequency weighting
             pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
+            pos_weight = torch.clamp(pos_weight, min=1.0, max=5.0)  # limit extreme weights
 
         weights = torch.ones_like(bce_raw)
-        weights[target['adjacency'] ==1] = pos_weight
+        weights[target_adj ==1] = pos_weight
         
         adj_loss = (bce_raw * weights).mean()
         losses['adjacency'] = adj_loss.item()
 
         # 2. Weight loss (only for existing connections)
-        # if 'weights' in target:
-        #     mask = target['adjacency'] > 0.5  # Only existing edges
-        #     if mask.sum() > 0:
-        #         weight_loss = self.mse(
-        #             pred['weights'][mask],
-        #             target['weights'][mask]
-        #         )
-        #     else:
-        #         weight_loss = torch.tensor(0.0, device=pred['weights'].device)
-        #     losses['weights'] = weight_loss.item()
-        # else:
-        #     weight_loss = torch.tensor(0.0)
-        #     losses['weights'] = 0.0
+        mask = target_adj > 0.5
+        if mask.sum() > 0:
+            weight_loss = self.mse(
+                pred['weights'][mask],
+                target['weights'][mask]
+            )
+        else:
+            weight_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        losses['weights'] = weight_loss.item()
         # TODO remove debug
-        weight_loss = torch.tensor(0.0, device=pred['adjacency'].device)
-        losses['weights'] = 0.0
+        # weight_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        # losses['weights'] = 0.0
         
         # 3. Sparsity regularization (encourage sparse graphs)
-        current_sparsity = 1 - pred['adjacency'].mean()
-        sparsity_loss = (current_sparsity - self.target_sparsity) ** 2
-        losses['sparsity'] = sparsity_loss.item()
+        # probs = torch.sigmoid(pred['adjacency'])
+        # current_sparsity = 1.0 - probs.mean()
+        # sparsity_loss = (current_sparsity - self.target_sparsity) ** 2
+        # losses['sparsity'] = sparsity_loss.item()
+        # TODO Remove sparsity loss, WMGM makes no guarantee on sparsity
+        sparsity_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        losses['sparsity'] = 0.0
 
         # 4. Optional: WMGM parameter loss
         # if 'wmgm_params' in pred and 'wmgm_params' in target:
@@ -98,9 +108,37 @@ class GraphReconstructionLoss(nn.Module):
         # else:
         #     param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
         #     losses['params'] = 0.0
+        if (
+            'wmgm_params_mu' in pred and
+            'wmgm_params_logvar' in pred and
+            'wmgm_params' in target and
+            target['wmgm_params'] is not None
+        ):
+            mu = pred['wmgm_params_mu']         # [B, D]
+            logvar = pred['wmgm_params_logvar'] # [B, D]
+            target_params = target['wmgm_params'].to(mu.device)  # [B, D]
+
+            # Reconstruction term: encourage posterior mean to match true WMGM params
+            recon_loss = self.mse(mu, target_params)
+
+            # KL term: KL(q(theta|x) || N(0, I)) averaged over batch
+            # KL = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+            kl = -0.5 * torch.sum(
+                1 + logvar - mu.pow(2) - logvar.exp(),
+                dim=-1
+            ).mean()
+
+            param_loss = recon_loss + self.kl_weight * kl
+
+            losses['params'] = param_loss.item()
+            losses['params_recon'] = recon_loss.item()
+            losses['params_kl'] = kl.item()
+        else:
+            param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+            losses['params'] = 0.0
         # TODO remove debug
-        param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
-        losses['params'] = 0.0
+        # param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
+        # losses['params'] = 0.0
         
         # Total loss
         total_loss = (
@@ -115,7 +153,7 @@ class GraphReconstructionLoss(nn.Module):
         return total_loss, losses
 
 
-def compute_metrics(pred_adj, true_adj, threshold=0.2):
+def compute_metrics(pred_adj, true_adj, threshold=0.5):
     """Compute graph reconstruction metrics"""
     device = pred_adj.device
     true_adj = true_adj.to(device)
@@ -147,7 +185,14 @@ def compute_metrics(pred_adj, true_adj, threshold=0.2):
     }
 
 
-def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
+def train_epoch(model, 
+                train_loader, 
+                optimizer, 
+                criterion, 
+                device, 
+                epoch, 
+                eval_threshold, 
+                edge_mask_prob):
     """Train for one epoch"""
     model.train()
     
@@ -170,10 +215,20 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
         
         # Prepare target
         # Extract true weights from adjacency if available
-        true_adj_binary = (true_adjacency != 0).float()        
+        true_adj_binary = (true_adjacency != 0).float()    
+
+        if edge_mask_prob > 0.0:
+            # mask edges with probability p
+            edge_mask = (torch.rand_like(true_adj_binary) > args.edge_mask_prob).float()
+
+            # apply mask to target adjacency
+            true_adj_binary_masked = true_adj_binary * edge_mask
+            target_adj_used = true_adj_binary_masked
+        else:
+            target_adj_used = true_adj_binary    
 
         target = {
-            'adjacency': true_adj_binary,       # for BCE
+            'adjacency': target_adj_used,       # for BCE
             'weights': true_adjacency.clone()   # keep full signed weights for MSE
         }
 
@@ -192,8 +247,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
         probs = torch.sigmoid(logits)
         metrics = compute_metrics(
             probs.detach(),
-            true_adjacency,
-            threshold=0.2
+            true_adj_binary,
+            threshold=eval_threshold,
         )
         all_metrics.append(metrics)
         
@@ -204,7 +259,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
         # debug: checking sparsity
         with torch.no_grad():
             pos_frac_true = true_adj_binary.mean().item()
-            pos_frac_pred = output['adjacency'].mean().item()
+            pred_binary = (probs > eval_threshold).float()  # match compute_metrics threshold
+            pos_frac_pred = pred_binary.mean().item()
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
             'f1': f'{metrics["f1"]:.3f}',
@@ -222,13 +278,16 @@ def train_epoch(model, train_loader, optimizer, criterion, device, epoch):
     return avg_loss, avg_metrics
 
 
-def validate(model, val_loader, criterion, device, epoch):
+def validate(model, val_loader, criterion, device, epoch, eval_threshold):
     """Validation"""
     model.eval()
     
     total_loss = 0.0
     all_metrics = []
     n_batches = len(val_loader)
+
+    all_probs = []
+    all_trues = []
     
     pbar = tqdm(val_loader, desc=f'Epoch {epoch} [Val]')
     
@@ -261,10 +320,14 @@ def validate(model, val_loader, criterion, device, epoch):
             probs = torch.sigmoid(logits)
             metrics = compute_metrics(
                 probs.detach(),
-                true_adjacency,
-                threshold=0.2
+                true_adj_binary,
+                threshold=eval_threshold,
             )
             all_metrics.append(metrics)
+
+            # Store for global metrics
+            all_probs.append(probs.detach().cpu())
+            all_trues.append(true_adj_binary.detach().cpu())
 
             # TODO optional debug
             # print(
@@ -277,15 +340,37 @@ def validate(model, val_loader, criterion, device, epoch):
                 'loss': f'{loss.item():.4f}',
                 'f1': f'{metrics["f1"]:.3f}'
             })
+
+    probs_cat = torch.cat(all_probs, dim=0).to(device)
+    trues_cat = torch.cat(all_trues, dim=0).to(device)
+
+    val_metrics = compute_metrics(
+        probs_cat,
+        trues_cat,
+        threshold=eval_threshold,
+    )
+    # Threshold sweep for debugging / analysis
+    sweep_thresholds = [0.2, 0.3, 0.4, 0.5, 0.6]
+    print("\n[Val threshold sweep]")
+    for thr in sweep_thresholds:
+        m = compute_metrics(probs_cat, trues_cat, threshold=thr)
+        print(
+            f"  thr={thr:.2f} | "
+            f"F1={m['f1']:.3f}, "
+            f"Prec={m['precision']:.3f}, "
+            f"Rec={m['recall']:.3f}, "
+            f"Acc={m['accuracy']:.3f}"
+        )
+    print()
     
     # Average
     avg_loss = total_loss / n_batches
-    avg_metrics = {
-        k: np.mean([m[k] for m in all_metrics])
-        for k in all_metrics[0].keys()
-    }
+    # avg_metrics = {
+    #     k: np.mean([m[k] for m in all_metrics])
+    #     for k in all_metrics[0].keys()
+    # }
     
-    return avg_loss, avg_metrics
+    return avg_loss, val_metrics # avg_metrics
 
 
 def main(args):
@@ -360,7 +445,8 @@ def main(args):
         weight_weight=args.weight_weight,
         sparsity_weight=args.sparsity_weight,
         target_sparsity=args.target_sparsity,
-        param_weight=args.param_weight
+        param_weight=args.param_weight,
+        kl_weight=args.kl_weight,
     )
     
     # Training loop
@@ -372,12 +458,19 @@ def main(args):
         
         # Train
         train_loss, train_metrics = train_epoch(
-            model, train_loader, optimizer, criterion, device, epoch
+            model, 
+            train_loader, 
+            optimizer, 
+            criterion, 
+            device, 
+            epoch, 
+            args.eval_threshold, 
+            args.edge_mask_prob
         )
         
         # Validate
         val_loss, val_metrics = validate(
-            model, val_loader, criterion, device, epoch
+            model, val_loader, criterion, device, epoch, args.eval_threshold
         )
         
         # Step scheduler
@@ -447,7 +540,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_e', type=int, default=900)
     parser.add_argument('--n_i', type=int, default=225)
     parser.add_argument('--n_timesteps_full', type=int, default=10000)
-    parser.add_argument('--temporal_downsampling', type=int, default=50)
+    parser.add_argument('--temporal_downsampling', type=int, default=50) # TODO test diff values e.g. 100
     parser.add_argument('--n_timesteps', type=int, default=1000)  # After downsampling
     parser.add_argument('--embedding_dim', type=int, default=64)
     parser.add_argument('--grid_size', type=int, default=64)
@@ -460,22 +553,27 @@ if __name__ == "__main__":
                         help='Weight for BCE loss term')
     parser.add_argument('--weight_weight', type=float, default=0.5,
                         help='Weight for weight MSE loss term')
-    parser.add_argument('--sparsity_weight', type=float, default=0.1,
+    parser.add_argument('--sparsity_weight', type=float, default=0.0,
                         help='Weight for sparsity loss term')
-    parser.add_argument('--target_sparsity', type=float, default=0.95,
+    parser.add_argument('--target_sparsity', type=float, default=0.8,
                         help='Target sparsity level for predicted graphs')
-    parser.add_argument('--param_dim', type=int, default=0,
+    parser.add_argument('--param_dim', type=int, default=None,
                         help='Max dimension of WMGM params, if any [2x2xMAX_R]')
     parser.add_argument('--param_weight', type=float, default=0.0,
                         help='Weight for WMGM parameter loss term')
+    parser.add_argument('--kl_weight', type=float, default=1e-3,
+                        help='Weight for KL divergence term in WMGM parameter loss')
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--edge_mask_prob', type=float, default=0.0,
+                        help='Probability of masking edges in target during training')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--save_every', type=int, default=10)
+    parser.add_argument('--eval_threshold', type=float, default=0.4)
     
     args = parser.parse_args()
     
