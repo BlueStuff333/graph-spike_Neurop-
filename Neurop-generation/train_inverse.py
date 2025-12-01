@@ -27,16 +27,12 @@ class GraphReconstructionLoss(nn.Module):
         self,
         bce_weight=1.0,
         weight_weight=0.5,
-        sparsity_weight=0.1,
-        target_sparsity=0.80,
         param_weight=0.0,
         kl_weight=1e-3,
     ):
         super().__init__()
         self.bce_weight = bce_weight
         self.weight_weight = weight_weight
-        self.sparsity_weight = sparsity_weight
-        self.target_sparsity = target_sparsity
         self.param_weight = param_weight
         self.kl_weight = kl_weight
 
@@ -88,18 +84,6 @@ class GraphReconstructionLoss(nn.Module):
         else:
             weight_loss = torch.tensor(0.0, device=pred['adjacency'].device)
         losses['weights'] = weight_loss.item()
-        # TODO remove debug
-        # weight_loss = torch.tensor(0.0, device=pred['adjacency'].device)
-        # losses['weights'] = 0.0
-        
-        # 3. Sparsity regularization (encourage sparse graphs)
-        # probs = torch.sigmoid(pred['adjacency'])
-        # current_sparsity = 1.0 - probs.mean()
-        # sparsity_loss = (current_sparsity - self.target_sparsity) ** 2
-        # losses['sparsity'] = sparsity_loss.item()
-        # TODO Remove sparsity loss, WMGM makes no guarantee on sparsity
-        sparsity_loss = torch.tensor(0.0, device=pred['adjacency'].device)
-        losses['sparsity'] = 0.0
 
         # 4. Optional: WMGM parameter loss
         # if 'wmgm_params' in pred and 'wmgm_params' in target:
@@ -144,7 +128,6 @@ class GraphReconstructionLoss(nn.Module):
         total_loss = (
             self.bce_weight * adj_loss +
             self.weight_weight * weight_loss +
-            self.sparsity_weight * sparsity_loss +
             self.param_weight * param_loss
         )
         
@@ -418,7 +401,8 @@ def main(args):
         n_e=args.n_e,
         n_i=args.n_i,
         n_timesteps=args.n_timesteps,
-        temporal_downsampling=args.temporal_downsampling
+        temporal_downsampling=args.temporal_downsampling,
+        MAX_R=args.MAX_R,
     )
     
     print(f"Training samples: {len(train_loader.dataset)}")
@@ -442,8 +426,6 @@ def main(args):
     criterion = GraphReconstructionLoss(
         bce_weight=args.bce_weight,
         weight_weight=args.weight_weight,
-        sparsity_weight=args.sparsity_weight,
-        target_sparsity=args.target_sparsity,
         param_weight=args.param_weight,
         kl_weight=args.kl_weight,
     )
@@ -543,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument('--grid_size', type=int, default=64)
     parser.add_argument('--mwt_levels', type=int, default=4)
     parser.add_argument('--k', type=int, default=4)
+    parser.add_argument('--MAX_R', type=int, default=3)
     parser.add_argument('--base', type=str, default='legendre')
     parser.add_argument('--predict_positions', action='store_true',
                         help='Also predict neuron positions')
@@ -550,10 +533,6 @@ if __name__ == "__main__":
                         help='Weight for BCE loss term')
     parser.add_argument('--weight_weight', type=float, default=0.5,
                         help='Weight for weight MSE loss term')
-    parser.add_argument('--sparsity_weight', type=float, default=0.0,
-                        help='Weight for sparsity loss term')
-    parser.add_argument('--target_sparsity', type=float, default=0.8,
-                        help='Target sparsity level for predicted graphs')
     parser.add_argument('--param_dim', type=int, default=None,
                         help='Max dimension of WMGM params, if any [2x2xMAX_R]')
     parser.add_argument('--param_weight', type=float, default=0.0,
