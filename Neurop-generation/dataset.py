@@ -26,6 +26,8 @@ class RasterGraphDataset(Dataset):
         n_timesteps,
         temporal_downsampling,
         MAX_R,
+        wmgm_mean=None,
+        wmgm_std=None,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -33,6 +35,8 @@ class RasterGraphDataset(Dataset):
         self.n_timesteps = n_timesteps
         self.temporal_downsampling = temporal_downsampling
         self.MAX_R = MAX_R
+        self.wmgm_mean = wmgm_mean
+        self.wmgm_std = wmgm_std
 
         # Collect all .mat files in the directory
         self.files = sorted(
@@ -94,6 +98,8 @@ class RasterGraphDataset(Dataset):
             extra = np.array([M_val, K_val, R_val], dtype=np.float32)  # 3,
 
             params_vec = np.concatenate([p_flat, L, extra]) # (4*max_R + 2 + 3,)
+            if self.wmgm_mean is not None and self.wmgm_std is not None:
+                params_vec = (params_vec - self.wmgm_mean) / (self.wmgm_std + 1e-8)
 
             wmgm_params = torch.from_numpy(params_vec) # TODO does this need to have .float() at the end?
             
@@ -180,12 +186,16 @@ def create_dataloaders(
     """
     Factory to build train/val dataloaders. This is what your script imports.
     """
+    # Compute WMGM stats from training set
+    wmgm_mean, wmgm_std = compute_wmgm_stats(data_dir + '/train', MAX_R)
     train_dataset = RasterGraphDataset(
         data_dir=data_dir + '/train',
         n_neurons=n_neurons,
         n_timesteps=n_timesteps,
         temporal_downsampling=temporal_downsampling,
         MAX_R=MAX_R,
+        wmgm_mean=wmgm_mean,
+        wmgm_std=wmgm_std,
     )
 
     val_dataset = RasterGraphDataset(
@@ -194,6 +204,8 @@ def create_dataloaders(
         n_timesteps=n_timesteps,
         temporal_downsampling=temporal_downsampling,
         MAX_R=MAX_R,
+        wmgm_mean=wmgm_mean, # use train stats
+        wmgm_std=wmgm_std,
     )
 
     train_loader = DataLoader(
@@ -213,3 +225,59 @@ def create_dataloaders(
     )
 
     return train_loader, val_loader
+
+def compute_wmgm_stats(data_dir, MAX_R):
+    """
+    One pass over train .mat files to compute mean/std of WMGM params.
+    Memory-safe: only keeps running sums of dimension D ~ (4*MAX_R + 2 + 3).
+    """
+    data_dir = Path(data_dir)
+    files = sorted(data_dir.glob("*.mat"))
+
+    sum_vec = None
+    sum_sq_vec = None
+    count = 0
+
+    for path in files:
+        mat = sio.loadmat(path)
+
+        # Only use files that actually have WMGM params
+        if not all(k in mat for k in ["P", "L", "M", "K", "R"]):
+            continue
+
+        P = np.asarray(mat["P"], dtype=np.float32)   # (2,2,R) or (2,2)
+        if P.ndim == 2:
+            P = P[:, :, None]                        # => (2,2,1)
+
+        L = np.asarray(mat["L"], dtype=np.float32).ravel()  # (2,)
+        M_val = int(np.asarray(mat["M"]).squeeze())
+        K_val = int(np.asarray(mat["K"]).squeeze())
+        R_val = int(np.asarray(mat["R"]).squeeze())
+
+        # Pad P to (2,2,MAX_R) exactly as in __getitem__
+        P_fixed = np.zeros((2, 2, MAX_R), dtype=np.float32)
+        R_clamped = min(P.shape[-1], MAX_R)
+        P_fixed[:, :, :R_clamped] = P[:, :, :R_clamped]
+
+        p_flat = P_fixed.flatten()                          # 4*MAX_R
+        extra = np.array([M_val, K_val, R_val], np.float32) # 3
+        params_vec = np.concatenate([p_flat, L, extra])     # (4*MAX_R + 2 + 3,)
+
+        if sum_vec is None:
+            sum_vec = params_vec.astype(np.float64)
+            sum_sq_vec = (params_vec.astype(np.float64) ** 2)
+        else:
+            sum_vec += params_vec
+            sum_sq_vec += params_vec ** 2
+
+        count += 1
+
+    if count == 0:
+        # No WMGM params in this dataset
+        return None, None
+
+    mean = sum_vec / count
+    var = sum_sq_vec / count - mean ** 2
+    std = np.sqrt(np.maximum(var, 1e-8))
+
+    return mean.astype(np.float32), std.astype(np.float32)

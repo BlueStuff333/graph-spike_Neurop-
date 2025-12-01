@@ -4,18 +4,106 @@ Training script for Inverse Problem: Raster → Graph
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 # from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import argparse
 from pathlib import Path
+import random
 import time
 from tqdm import tqdm
 
 from inverse_model import RasterToGraphMWT
 from dataset import create_dataloaders
 
+def print_param_sample(mu, true_params, batch_idx=0, MAX_R=3, wmgm_mean=None, wmgm_std=None):
+    """
+    Print a small, readable sample of WMGM parameters, 
+    last output of forward pass of batch at batch_idx:
+    - P matrices (2x2 per level)
+    - L vector
+    - M, K, R scalars
+    """
+    mu = mu[batch_idx].detach().cpu().numpy()
+    tp = true_params[batch_idx].detach().cpu().numpy()
+
+    if wmgm_mean is not None and wmgm_std is not None:
+        mu = mu * (wmgm_std + 1e-8) + wmgm_mean
+        tp = tp * (wmgm_std + 1e-8) + wmgm_mean
+
+    # First 4*MAX_R entries are P_fixed.flatten() in C-order
+    n_p = 4 * MAX_R
+    mu_P  = mu[:n_p].reshape(2, 2, MAX_R)   # (2,2,MAX_R)
+    tp_P  = tp[:n_p].reshape(2, 2, MAX_R)
+
+    # Next 2 entries are L
+    mu_L  = mu[n_p:n_p+2]
+    tp_L  = tp[n_p:n_p+2]
+
+    # Last 3 entries are (M, K, R)
+    mu_M, mu_K, mu_R = mu[n_p+2:n_p+5]
+    tp_M, tp_K, tp_R = tp[n_p+2:n_p+5]
+
+    print(f"\n=== WMGM PARAMETER SAMPLE Index: {batch_idx} ===")
+
+    print("P matrices (per level r):")
+    for r in range(MAX_R):
+        print(f"  Level r={r}:")
+        print(f"    Pred: [{mu_P[0,0,r]:.3f}  {mu_P[0,1,r]:.3f}]")
+        print(f"          [{mu_P[1,0,r]:.3f}  {mu_P[1,1,r]:.3f}]")
+        print(f"    True: [{tp_P[0,0,r]:.3f}  {tp_P[0,1,r]:.3f}]")
+        print(f"          [{tp_P[1,0,r]:.3f}  {tp_P[1,1,r]:.3f}]\n")
+
+    print("L vector:")
+    print(f"  Pred: [{mu_L[0]:.3f}, {mu_L[1]:.3f}]")
+    print(f"  True: [{tp_L[0]:.3f}, {tp_L[1]:.3f}]\n")
+
+    print("Extra scalars (M, K, R):")
+    print(f"  Pred: M={mu_M:.2f}, K={mu_K:.2f}, R={mu_R:.2f}")
+    print(f"  True: M={tp_M:.2f}, K={tp_K:.2f}, R={tp_R:.2f}")
+    print("=====================================\n")
+
+def binary_focal_loss_with_logits(
+        logits,
+        targets,
+        alpha: float,
+        gamma: float,
+        reduction: str = 'mean',
+    ):
+    """
+    Focal loss for binary classification with logits input.
+    logits: arbitrary shape e.g. [B, N, N]
+    targets: same shape as logits, with binary labels (0 or 1)
+    """
+    # Per-element BCE loss
+    bce = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction='none'
+    )
+
+    # p_t = p if y == 1 else 1 - p
+    probs = torch.sigmoid(logits)
+    p_t = probs * targets + (1 - probs) * (1 - targets)
+
+    # focal scaling
+    f_factor = (1 - p_t).pow(gamma)
+
+    # alpha class balancing
+    if alpha is not None:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * f_factor * bce
+    else:
+        loss = f_factor * bce
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
 
 class GraphReconstructionLoss(nn.Module):
     """
@@ -29,6 +117,7 @@ class GraphReconstructionLoss(nn.Module):
         weight_weight=0.5,
         param_weight=0.0,
         kl_weight=1e-3,
+        pos_weight=1.0,
     ):
         super().__init__()
         self.bce_weight = bce_weight
@@ -52,7 +141,14 @@ class GraphReconstructionLoss(nn.Module):
         losses = {}
         
         # 1. Binary connectivity loss
-        bce_raw = self.bce(pred['adjacency'], target['adjacency'])
+        # bce_raw = self.bce(pred['adjacency'], target['adjacency'])
+        bce_raw = binary_focal_loss_with_logits(
+            pred['adjacency'],
+            target['adjacency'],
+            alpha=0.55,
+            gamma=2.5,
+            reduction='none'
+        )
         # There are no self-connections; mask out diagonal
         batch, n, _ = bce_raw.shape
         eye = torch.eye(n, device=bce_raw.device).unsqueeze(0)  # [1, n, n]
@@ -62,16 +158,16 @@ class GraphReconstructionLoss(nn.Module):
         target_adj = target['adjacency'] * mask
         
         # estimate positive fractions in this batch
-        with torch.no_grad():
-            pos_frac = target_adj.mean().clamp(min=1e-4, max=1-1e-4)
-            # approx inverse-frequency weighting
-            pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
-            pos_weight = torch.clamp(pos_weight, min=1.0, max=3.0)  # limit extreme weights
+        # with torch.no_grad():
+        #     pos_frac = target_adj.mean().clamp(min=1e-4, max=1-1e-4)
+        #     # approx inverse-frequency weighting
+        #     pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
+        #     pos_weight = torch.clamp(pos_weight, min=1.0, max=3.0)  # limit extreme weights
 
-        weights = torch.ones_like(bce_raw)
-        weights[target_adj ==1] = pos_weight
-        
-        adj_loss = (bce_raw * weights).mean()
+        # weights = torch.ones_like(bce_raw)
+        # weights[target_adj ==1] = pos_weight
+        # adj_loss = (bce_raw * weights).sum() / weights.sum()
+        adj_loss = bce_raw.mean()
         losses['adjacency'] = adj_loss.item()
 
         # 2. Weight loss (only for existing connections)
@@ -86,12 +182,6 @@ class GraphReconstructionLoss(nn.Module):
         losses['weights'] = weight_loss.item()
 
         # 4. Optional: WMGM parameter loss
-        # if 'wmgm_params' in pred and 'wmgm_params' in target:
-        #     param_loss = self.mse(pred['wmgm_params'], target['wmgm_params'])
-        #     losses['params'] = param_loss.item()
-        # else:
-        #     param_loss = torch.tensor(0.0, device=pred['adjacency'].device)
-        #     losses['params'] = 0.0
         if (
             'wmgm_params_mu' in pred and
             'wmgm_params_logvar' in pred and
@@ -166,6 +256,27 @@ def compute_metrics(pred_adj, true_adj, threshold=0.5):
         'recall': recall,
         'f1': f1
     }
+
+def update_degree_histograms(true_adj_bin, pred_adj_bin, 
+                             true_hist, pred_hist, bin_edges):
+    """
+    Update running histograms of degree distributions.
+
+    true_adj_bin, pred_adj_bin: [B, N, N] binary tensors
+    true_hist, pred_hist: numpy arrays of shape [num_bins]
+    bin_edges: numpy array of shape [num_bins + 1]
+    """
+    # Degrees per node: sum over incoming edges (or outgoing, symmetric here)
+    true_deg = true_adj_bin.sum(dim=-1).cpu().numpy().ravel()
+    pred_deg = pred_adj_bin.sum(dim=-1).cpu().numpy().ravel()
+
+    th, _ = np.histogram(true_deg, bins=bin_edges)
+    ph, _ = np.histogram(pred_deg, bins=bin_edges)
+
+    true_hist += th
+    pred_hist += ph
+
+    return true_hist, pred_hist
 
 
 def train_epoch(model, 
@@ -274,6 +385,12 @@ def validate(model, val_loader, criterion, device, epoch, eval_threshold):
     
     pbar = tqdm(val_loader, desc=f'Epoch {epoch} [Val]')
     
+    # log-ish bins; tweak max as needed.
+    # Edges per node are <= n_neurons, but in practice mean degree is much smaller.
+    deg_bin_edges = np.array([0, 1, 2, 4, 8, 16, 32, 64, 128, 256])
+    true_deg_hist = np.zeros(len(deg_bin_edges) - 1, dtype=np.float64)
+    pred_deg_hist = np.zeros_like(true_deg_hist)
+
     with torch.no_grad():
         for graph_data, raster in pbar:
             # Move to device
@@ -312,6 +429,16 @@ def validate(model, val_loader, criterion, device, epoch, eval_threshold):
             all_probs.append(probs.detach().cpu())
             all_trues.append(true_adj_binary.detach().cpu())
 
+            # Tracking degree distributions
+            pred_bin = (probs > eval_threshold).float()
+            true_bin = true_adj_binary  # already binary
+
+            true_deg_hist, pred_deg_hist = update_degree_histograms(
+                true_bin, pred_bin,
+                true_deg_hist, pred_deg_hist,
+                deg_bin_edges,
+            )           
+
             # TODO optional debug
             # print(
             #     f"[Val debug] prob_min={probs.min().item():.3f}, "
@@ -345,6 +472,30 @@ def validate(model, val_loader, criterion, device, epoch, eval_threshold):
             f"Acc={m['accuracy']:.3f}"
         )
     print()
+
+    # summarize degree distribution differences ----
+    true_total = true_deg_hist.sum()
+    pred_total = pred_deg_hist.sum()
+    if true_total > 0:
+        true_deg_hist_norm = true_deg_hist / true_total
+    else:
+        true_deg_hist_norm = true_deg_hist
+
+    if pred_total > 0:
+        pred_deg_hist_norm = pred_deg_hist / pred_total
+    else:
+        pred_deg_hist_norm = pred_deg_hist
+
+    # L1 distance between normalized histograms (0 = perfect match)
+    deg_L1 = np.abs(true_deg_hist_norm - pred_deg_hist_norm).sum()
+
+    # TODO remove debug
+    # is there a way to only print this sometimes? eg 10% of the time?
+    print("[Val MF degree-distribution stats]")
+    print("  bin edges        :", deg_bin_edges)
+    print("  true degree hist :", np.round(true_deg_hist_norm, 4))
+    print("  pred degree hist :", np.round(pred_deg_hist_norm, 4))
+    print(f"  L1 histogram gap : {deg_L1:.4f}")
     
     # Average
     avg_loss = total_loss / n_batches
@@ -353,7 +504,7 @@ def validate(model, val_loader, criterion, device, epoch, eval_threshold):
     #     for k in all_metrics[0].keys()
     # }
     
-    return avg_loss, val_metrics # avg_metrics
+    return avg_loss, val_metrics #avg_metrics
 
 
 def main(args):
@@ -468,15 +619,34 @@ def main(args):
         print(f"\nEpoch {epoch}/{args.epochs} ({epoch_time:.1f}s)")
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"  Train Metrics: F1={train_metrics['f1']:.3f}, " +
-              f"Acc={train_metrics['accuracy']:.3f}, " +
               f"Prec={train_metrics['precision']:.3f}, " +
-              f"Rec={train_metrics['recall']:.3f}")
+              f"Rec={train_metrics['recall']:.3f}" +
+              f"Acc={train_metrics['accuracy']:.3f}")
         print(f"  Val Loss: {val_loss:.4f}")
         print(f"  Val Metrics: F1={val_metrics['f1']:.3f}, " +
               f"Acc={val_metrics['accuracy']:.3f}, " +
               f"Prec={val_metrics['precision']:.3f}, " +
               f"Rec={val_metrics['recall']:.3f}")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        if model.param_dim is not None:
+            model.eval()
+            with torch.no_grad():
+                # Take the first batch from validation set
+                graph_data, raster = next(iter(val_loader))
+
+                raster = raster.to(device)
+                positions = graph_data["positions"].to(device)
+
+                out = model(raster, positions)
+
+                if "wmgm_params_mu" in out and "wmgm_params" in graph_data:
+                    mu = out["wmgm_params_mu"].detach().cpu()
+                    true_params = graph_data["wmgm_params"].detach().cpu()
+                    print_param_sample(mu, true_params, batch_idx=0, MAX_R=args.MAX_R, 
+                                       wmgm_mean=val_loader.dataset.wmgm_mean,
+                                       wmgm_std=val_loader.dataset.wmgm_std)
+                    # print_param_sample(mu, true_params, sample_idx=1, MAX_R=args.MAX_R)
+            model.train()
         
         # Save best model (based on F1 score)
         if val_metrics['f1'] > best_f1:
@@ -519,7 +689,9 @@ if __name__ == "__main__":
     parser.add_argument('--grid_size', type=int, default=64)
     parser.add_argument('--mwt_levels', type=int, default=4)
     parser.add_argument('--k', type=int, default=4)
-    parser.add_argument('--MAX_R', type=int, default=3)
+    parser.add_argument('--MAX_R', type=int, default=3,
+                        help='Max resolution levels for WMGM parameters '
+                        '(1 less than dimension, 0 indexed)')
     parser.add_argument('--base', type=str, default='legendre')
     parser.add_argument('--predict_positions', action='store_true',
                         help='Also predict neuron positions')

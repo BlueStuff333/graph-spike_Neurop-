@@ -23,8 +23,8 @@ class MWTOperator1D(nn.Module):
         3. Reconstruction from coarsest scale back to finest scale
 
     Shapes (time domain):
-        Input:  s_fine  \in R^{B x N x k x 2^J}
-        Output: s_out   \in R^{B x N x k x 2^J}
+        Input:  s_fine  in R^{B x N x k x 2^J}
+        Output: s_out   in R^{B x N x k x 2^J}
 
     Here:
         B = batch size
@@ -140,8 +140,6 @@ class RasterToGraphMWT(nn.Module):
     
     Args:
         n_neurons: Number of neurons (default: 1125)
-        n_e: Number of excitatory neurons (default: 900)
-        n_i: Number of inhibitory neurons (default: 225)
         n_timesteps: Number of temporal bins (default: 1000)
         embedding_dim: Feature dimension (default: 64)
         grid_size: Spatial grid size for MWT (default: 64)
@@ -156,8 +154,6 @@ class RasterToGraphMWT(nn.Module):
     def __init__(
         self,
         n_neurons=1125,
-        n_e=900,
-        n_i=225,
         n_timesteps=1000,
         embedding_dim=64,
         grid_size=64,
@@ -170,8 +166,6 @@ class RasterToGraphMWT(nn.Module):
         super().__init__()
         
         self.n_neurons = n_neurons
-        self.n_e = n_e
-        self.n_i = n_i
         self.n_timesteps = n_timesteps
         self.embedding_dim = embedding_dim
         self.grid_size = grid_size
@@ -203,15 +197,6 @@ class RasterToGraphMWT(nn.Module):
         )
 
         # 4 (Optional) Parameter Decoder - Predict WMGM params
-        # if param_dim is not None:
-        #     self.param_dim = param_dim
-        #     self.param_decoder = nn.Sequential(
-        #         nn.Linear(embedding_dim, 128),
-        #         nn.ReLU(),
-        #         nn.Linear(128, 64),
-        #         nn.ReLU(),
-        #         nn.Linear(64, self.param_dim)
-        #     )
         if param_dim is not None and param_dim > 0:
             self.param_dim = param_dim
             # Output 2 * param_dim: [mu | logvar]
@@ -725,8 +710,6 @@ if __name__ == "__main__":
     # Create model
     model = RasterToGraphMWT(
         n_neurons=n_neurons,
-        n_e=900,
-        n_i=225,
         n_timesteps=n_timesteps,
         embedding_dim=64,
         grid_size=64,
