@@ -168,8 +168,7 @@ class RasterGraphDataset(Dataset):
 
 
 def create_dataloaders(
-    train_dir,
-    val_dir,
+    data_dir,
     batch_size,
     num_workers,
     n_neurons,
@@ -182,7 +181,7 @@ def create_dataloaders(
     Factory to build train/val dataloaders. This is what your script imports.
     """
     train_dataset = RasterGraphDataset(
-        data_dir=train_dir,
+        data_dir=data_dir + '/train',
         n_neurons=n_neurons,
         n_e=n_e,
         n_i=n_i,
@@ -191,7 +190,7 @@ def create_dataloaders(
     )
 
     val_dataset = RasterGraphDataset(
-        data_dir=val_dir,
+        data_dir=data_dir + '/test',
         n_neurons=n_neurons,
         n_e=n_e,
         n_i=n_i,

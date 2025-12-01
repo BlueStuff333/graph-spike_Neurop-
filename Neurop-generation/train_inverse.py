@@ -381,7 +381,7 @@ def main(args):
     print(f"Using device: {device}")
     
     # Create output directory
-    output_dir = Path(args.out_dir)
+    output_dir = Path(args.data_dir + '/out')
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Initialize tensorboard
@@ -411,8 +411,7 @@ def main(args):
     # Create dataloaders
     print("Loading data...")
     train_loader, val_loader = create_dataloaders(
-        train_dir=args.train_dir,
-        val_dir=args.val_dir,
+        data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         n_neurons=args.n_neurons,
@@ -531,9 +530,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train Raster-to-Graph Model (Inverse)')
     
     # Data parameters
-    parser.add_argument('--train_dir', type=str, required=True)
-    parser.add_argument('--val_dir', type=str, required=True)
-    parser.add_argument('--out_dir', type=str, default='./outputs_inverse')
+    parser.add_argument('--data_dir', type=str, required=True)
     
     # Model parameters
     parser.add_argument('--n_neurons', type=int, default=1125)
