@@ -26,7 +26,8 @@ class RasterGraphDataset(Dataset):
         n_e,
         n_i,
         n_timesteps,
-        temporal_downsampling=1,
+        temporal_downsampling,
+        MAX_R,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -35,6 +36,7 @@ class RasterGraphDataset(Dataset):
         self.n_i = n_i
         self.n_timesteps = n_timesteps
         self.temporal_downsampling = temporal_downsampling
+        self.MAX_R = MAX_R
 
         # Collect all .mat files in the directory
         self.files = sorted(
@@ -72,8 +74,6 @@ class RasterGraphDataset(Dataset):
         # WMGM parameters, if available
         wmgm_params = None
         if all(k in mat for k in ["P", "L", "M", "K", "R"]):
-            MAX_R = 2 # adjust as needed, set to the same (or greater) value as the max in your data generation
-
             P = np.asarray(mat["P"], dtype=np.float32)  # (2, 2, R)
             # Ensure P is always 3D: (2, 2, R)
             if P.ndim == 2:
@@ -85,8 +85,8 @@ class RasterGraphDataset(Dataset):
             R_val = int(np.asarray(mat["R"]).squeeze())
 
             # Pad P to (2, 2, MAX_R)
-            P_fixed = np.zeros((2, 2, MAX_R), dtype=np.float32)
-            R_clamped = min(P.shape[-1], MAX_R)
+            P_fixed = np.zeros((2, 2, self.MAX_R), dtype=np.float32)
+            R_clamped = min(P.shape[-1], self.MAX_R)
             P_fixed [:, :, :R_clamped] = P[:, :, :R_clamped]
 
             p_flat = P_fixed.flatten() # 4 * max_R
@@ -176,6 +176,7 @@ def create_dataloaders(
     n_i,
     n_timesteps,
     temporal_downsampling,
+    MAX_R,
 ):
     """
     Factory to build train/val dataloaders. This is what your script imports.
@@ -187,6 +188,7 @@ def create_dataloaders(
         n_i=n_i,
         n_timesteps=n_timesteps,
         temporal_downsampling=temporal_downsampling,
+        MAX_R=MAX_R,
     )
 
     val_dataset = RasterGraphDataset(
@@ -196,6 +198,7 @@ def create_dataloaders(
         n_i=n_i,
         n_timesteps=n_timesteps,
         temporal_downsampling=temporal_downsampling,
+        MAX_R=MAX_R,
     )
 
     train_loader = DataLoader(
