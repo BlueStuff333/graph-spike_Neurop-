@@ -66,7 +66,7 @@ class GraphReconstructionLoss(nn.Module):
             pos_frac = target_adj.mean().clamp(min=1e-4, max=1-1e-4)
             # approx inverse-frequency weighting
             pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
-            pos_weight = torch.clamp(pos_weight, min=1.0, max=5.0)  # limit extreme weights
+            pos_weight = torch.clamp(pos_weight, min=1.0, max=3.0)  # limit extreme weights
 
         weights = torch.ones_like(bce_raw)
         weights[target_adj ==1] = pos_weight
@@ -374,8 +374,6 @@ def main(args):
     print("Creating model...")
     model = RasterToGraphMWT(
         n_neurons=args.n_neurons,
-        n_e=args.n_e,
-        n_i=args.n_i,
         n_timesteps=args.n_timesteps,
         embedding_dim=args.embedding_dim,
         grid_size=args.grid_size,
@@ -398,8 +396,6 @@ def main(args):
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         n_neurons=args.n_neurons,
-        n_e=args.n_e,
-        n_i=args.n_i,
         n_timesteps=args.n_timesteps,
         temporal_downsampling=args.temporal_downsampling,
         MAX_R=args.MAX_R,
@@ -516,8 +512,6 @@ if __name__ == "__main__":
     
     # Model parameters
     parser.add_argument('--n_neurons', type=int, default=1125)
-    parser.add_argument('--n_e', type=int, default=900)
-    parser.add_argument('--n_i', type=int, default=225)
     parser.add_argument('--n_timesteps_full', type=int, default=10000)
     parser.add_argument('--temporal_downsampling', type=int, default=50) # TODO test diff values e.g. 100
     parser.add_argument('--n_timesteps', type=int, default=1000)  # After downsampling

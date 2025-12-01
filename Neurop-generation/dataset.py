@@ -60,6 +60,7 @@ class RasterGraphDataset(Dataset):
             # Combine into a 2-channel one-hot
             positions = np.stack([e_mask, i_mask], axis=-1).astype(np.float32)  # (n, 2)
         else:
+            print(f"Warning: positions not found in {path}, using dummy positions.")
             # dummy positions on a unit square grid if you don't have them yet
             # (N, 2)
             N = adj.shape[0]
@@ -172,8 +173,6 @@ def create_dataloaders(
     batch_size,
     num_workers,
     n_neurons,
-    n_e,
-    n_i,
     n_timesteps,
     temporal_downsampling,
     MAX_R,
@@ -184,8 +183,6 @@ def create_dataloaders(
     train_dataset = RasterGraphDataset(
         data_dir=data_dir + '/train',
         n_neurons=n_neurons,
-        n_e=n_e,
-        n_i=n_i,
         n_timesteps=n_timesteps,
         temporal_downsampling=temporal_downsampling,
         MAX_R=MAX_R,
@@ -194,8 +191,6 @@ def create_dataloaders(
     val_dataset = RasterGraphDataset(
         data_dir=data_dir + '/test',
         n_neurons=n_neurons,
-        n_e=n_e,
-        n_i=n_i,
         n_timesteps=n_timesteps,
         temporal_downsampling=temporal_downsampling,
         MAX_R=MAX_R,
