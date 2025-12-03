@@ -16,9 +16,12 @@ class SpikeEncoder(nn.Module):
         
         self.register_buffer("t_axis", torch.arange(seq_len).float())
     
-    def forward(self, events: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, events: torch.Tensor, batch_idx: torch.Tensor, B: int = None) -> torch.Tensor:
+        if B is None:
+            B = int(batch_idx.max().item()) + 1 if events.numel() > 0 else 0
+
         if events.shape[0] == 0:
-            return torch.zeros(1, self.n_neurons, self.seq_len, device=events.device)
+            return torch.zeros(B, self.n_neurons, self.seq_len, device=events.device)
             
         B = batch_idx.max().item() + 1
         
@@ -62,31 +65,164 @@ class TemporalFourierOperator1D(nn.Module):
         )
 
     def forward(self, spikes):
-        B, N, T = spikes.shape
+        # B, N, T = spikes.shape
 
-        x_f = fft.rfft(spikes, dim=-1)
+        x_f = fft.rfft(spikes, dim=-1)          # [B, N, K]
         x_f = x_f[..., :self.n_modes]
         K = x_f.shape[-1]
 
-        x_real = x_f.real
-        x_imag = x_f.imag
+        x_real, x_imag = x_f.real, x_f.imag     # [B, N, K]
 
-        W_r = self.weight_real[:K]
+        W_r = self.weight_real[:K]             # [K, d_model]
         W_i = self.weight_imag[:K]
 
-        a = x_real.unsqueeze(-1)
+        a = x_real.unsqueeze(-1)               # [B, N, K, 1]
         b = x_imag.unsqueeze(-1)
-        c = W_r.unsqueeze(0).unsqueeze(0)
+        c = W_r.unsqueeze(0).unsqueeze(0)      # [1, 1, K, d_model]
         d = W_i.unsqueeze(0).unsqueeze(0)
 
-        y_real = a * c - b * d
+        y_real = a * c - b * d                 # [B, N, K, d_model]
         y_imag = a * d + b * c
 
         y_mag = torch.sqrt(y_real ** 2 + y_imag ** 2 + 1e-8)
-        E = y_mag.mean(dim=2)
+        E = y_mag.mean(dim=2)                  # [B, N, d_model]
 
-        E = self.post_mlp(E)
-        return E
+        return self.post_mlp(E)                # [B, N, d_model]
+    
+class EdgeFourierCoeffNet(nn.Module):
+    """
+    H: [B, N, d_model] →
+    coeffs: [B, N, N] complex (2D FFT coefficients)
+    """
+    def __init__(self, d_model: int, hidden_dim: int = 256):
+        super().__init__()
+        self.source_proj = nn.Linear(d_model, hidden_dim)
+        self.target_proj = nn.Linear(d_model, hidden_dim)
+
+        # Output 2 channels: real, imag
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 2),      # (real, imag)
+        )
+
+    def forward(self, H):
+        B, N, D = H.shape
+
+        h_s = self.source_proj(H)                       # [B, N, H]
+        h_t = self.target_proj(H)                       # [B, N, H]
+
+        h_s_exp = h_s.unsqueeze(2).expand(B, N, N, -1)  # [B, N, N, H]
+        h_t_exp = h_t.unsqueeze(1).expand(B, N, N, -1)  # [B, N, N, H]
+        h_pair = torch.cat([h_s_exp, h_t_exp], dim=-1)  # [B, N, N, 2H]
+
+        coeff_rt = self.edge_mlp(h_pair)                # [B, N, N, 2]
+        real = coeff_rt[..., 0]
+        imag = coeff_rt[..., 1]
+
+        coeffs = torch.complex(real, imag)              # [B, N, N]
+        return coeffs
+
+class NodeFeatureNet(nn.Module):
+    """
+    Simple per-node MLP: E [B, N, d_in] → H [B, N, d_out]
+    """
+    def __init__(self, d_in: int, d_hidden: int, d_out: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, d_hidden),
+            nn.ReLU(),
+            nn.Linear(d_hidden, d_out),
+            nn.ReLU(),
+        )
+
+    def forward(self, E):
+        return self.net(E)   # [B, N, d_out]
+    
+class AdjacencyLinearDecoder2D(nn.Module):
+    """
+    coeffs: [B, N, N] complex (2D FFT coeffs)
+    → adj_logits: [B, N, N]
+    """
+    def __init__(self, n_neurons: int):
+        super().__init__()
+        self.n_neurons = n_neurons
+        self.flat_linear = nn.Linear(n_neurons * n_neurons,
+                                     n_neurons * n_neurons)
+
+    def forward(self, coeffs):
+        B, N, _ = coeffs.shape
+        assert N == self.n_neurons
+
+        # 2D inverse FFT to spatial domain
+        adj_spatial = fft.ifft2(coeffs, dim=(-2, -1)).real    # [B, N, N]
+
+        # Single learned matrix on flattened grid
+        flat = adj_spatial.view(B, N * N)                     # [B, N^2]
+        flat_out = self.flat_linear(flat)                     # [B, N^2]
+        adj_logits = flat_out.view(B, N, N)                   # [B, N, N]
+
+        # Optional: enforce symmetry
+        # sym = 0.5 * (adj_logits + adj_logits.transpose(1, 2))
+        # Optional: force no self-connections
+        # diag_mask = torch.eye(N, device=adj_logits.device).bool().unsqueeze(0)
+        # adj_logits = sym.masked_fill(diag_mask, float("-inf"))
+
+        adj_prob = torch.sigmoid(adj_logits)
+        return {"adj_logits": adj_logits, "adj_prob": adj_prob}
+    
+class SpikeToGraphFNO2D(nn.Module):
+    """
+    spikes [B, N, T] →
+    Temporal FNO (time) →
+    per-node NN →
+    edge Fourier coeffs →
+    2D iFFT →
+    linear matrix →
+    sigmoid → adjacency
+    """
+    def __init__(
+        self,
+        n_neurons: int,
+        seq_len: int,
+        d_model: int = 128,
+        n_modes_time: int = 32,
+        node_hidden: int = 128,
+        edge_hidden: int = 256,
+    ):
+        super().__init__()
+        self.n_neurons = n_neurons
+        self.seq_len = seq_len
+
+        self.temporal_op = TemporalFourierOperator1D(
+            n_modes=n_modes_time,
+            d_model=d_model,
+        )
+
+        self.node_net = NodeFeatureNet(
+            d_in=d_model,
+            d_hidden=node_hidden,
+            d_out=d_model,
+        )
+
+        self.coeff_net = EdgeFourierCoeffNet(
+            d_model=d_model,
+            hidden_dim=edge_hidden,
+        )
+
+        self.adj_decoder = AdjacencyLinearDecoder2D(
+            n_neurons=n_neurons,
+        )
+
+    def forward(self, spikes):
+        # spikes: [B, N, T]
+        E = self.temporal_op(spikes)           # [B, N, d_model]
+        H = self.node_net(E)                   # [B, N, d_model]
+        coeffs = self.coeff_net(H)             # [B, N, N] complex
+        out = self.adj_decoder(coeffs)         # dict with adj_logits / adj_prob
+        return out
 
 
 class GraphDecoder(nn.Module):
