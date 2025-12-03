@@ -5,7 +5,6 @@ from tqdm import tqdm
 from typing import Optional
 import os
 
-
 def train_step(model, encoder, loss_fn, optimizer, batch, device):
     model.train()
     
@@ -14,8 +13,9 @@ def train_step(model, encoder, loss_fn, optimizer, batch, device):
     adj_true = batch["adjacency"].to(device)
     
     optimizer.zero_grad()
-    
-    spikes = encoder(events, batch_idx)
+
+    B = batch["adjacency"].shape[0]
+    spikes = encoder(events, batch_idx, B=B)
     out = model(spikes)
     loss = loss_fn(out["adj_logits"], adj_true)
     
@@ -23,7 +23,6 @@ def train_step(model, encoder, loss_fn, optimizer, batch, device):
     optimizer.step()
     
     return loss.item()
-
 
 @torch.no_grad()
 def val_step(model, encoder, loss_fn, batch, device):
@@ -33,12 +32,12 @@ def val_step(model, encoder, loss_fn, batch, device):
     batch_idx = batch["batch_idx"].to(device)
     adj_true = batch["adjacency"].to(device)
     
-    spikes = encoder(events, batch_idx)
+    B = batch["adjacency"].shape[0]
+    spikes = encoder(events, batch_idx, B=B)
     out = model(spikes)
     loss = loss_fn(out["adj_logits"], adj_true)
     
     return loss.item()
-
 
 def train_epoch(model, encoder, loss_fn, optimizer, dataloader, device):
     total_loss = 0.0
@@ -49,7 +48,6 @@ def train_epoch(model, encoder, loss_fn, optimizer, dataloader, device):
     
     return total_loss / len(dataloader)
 
-
 @torch.no_grad()
 def val_epoch(model, encoder, loss_fn, dataloader, device):
     total_loss = 0.0
@@ -59,7 +57,6 @@ def val_epoch(model, encoder, loss_fn, dataloader, device):
         total_loss += loss
     
     return total_loss / len(dataloader)
-
 
 def train(
     model,
@@ -76,6 +73,7 @@ def train(
 ):
     model.to(device)
     encoder.to(device)
+    loss_fn.to(device)
     
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)

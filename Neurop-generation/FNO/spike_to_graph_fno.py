@@ -42,7 +42,6 @@ class SpikeEncoder(nn.Module):
         
         return flat_output.view(B, self.n_neurons, self.seq_len)
 
-
 class TemporalFourierOperator1D(nn.Module):
     """
     FNO-style operator over *time only*.
@@ -224,7 +223,6 @@ class SpikeToGraphFNO2D(nn.Module):
         out = self.adj_decoder(coeffs)         # dict with adj_logits / adj_prob
         return out
 
-
 class GraphDecoder(nn.Module):
     """
     Predict adjacency (logits & probs) and optional weights from node embeddings.
@@ -271,7 +269,6 @@ class GraphDecoder(nn.Module):
             "weights": weights,
         }
 
-
 class SpikeToGraph1D(nn.Module):
     def __init__(self, n_neurons: int, seq_len: int, d_model: int = 128, n_modes_time: int = 32):
         super().__init__()
@@ -293,7 +290,6 @@ class SpikeToGraph1D(nn.Module):
         out = self.decoder(E)
         return out
 
-
 class BinaryAdjacencyLoss(nn.Module):
     def __init__(self, pos_weight: float = None):
         super().__init__()
@@ -304,7 +300,6 @@ class BinaryAdjacencyLoss(nn.Module):
 
     def forward(self, adj_logits, adj_true):
         return self.bce(adj_logits, adj_true)
-
 
 if __name__ == "__main__":
     # Quick test
