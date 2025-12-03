@@ -134,6 +134,7 @@ class RasterGraphDataset(Dataset):
             raster_ds = raster_full
 
         # Crop / pad to n_timesteps
+        # print(f"raster_ds shape[0]: {raster_ds.shape[0]}")
         if raster_ds.shape[0] >= self.n_timesteps:
             raster = raster_ds[: self.n_timesteps]
         else:
@@ -142,6 +143,7 @@ class RasterGraphDataset(Dataset):
             raster = np.concatenate([raster_ds, pad], axis=0)
 
         # Optionally ensure correct neuron count (crop/pad)
+        # print(f"raster shape[1]: {raster_ds.shape[1]}")
         if raster.shape[1] > self.n_neurons:
             raster = raster[:, : self.n_neurons]
             adj = adj[: self.n_neurons, : self.n_neurons]
