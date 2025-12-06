@@ -5,6 +5,7 @@ import scipy.io as sio
 import numpy as np
 from typing import Optional, Sequence
 
+
 class SpikeGraphDataset(Dataset):
     """Dataset for WMGM spike + graph .mat files.
 
@@ -71,6 +72,7 @@ class SpikeGraphDataset(Dataset):
         return self._normalize_array(mat[key])
 
     # ---------- main access ----------
+
     def __getitem__(self, idx: int) -> dict:
         mat = sio.loadmat(self.files[idx], squeeze_me=True, struct_as_record=False)
 
@@ -78,7 +80,7 @@ class SpikeGraphDataset(Dataset):
         events = self._load_field(mat, self.spike_key)   # [n_spikes, 2]
         adj = self._load_field(mat, self.adj_key)        # [N, N]
 
-        # optional locs (MATLAB indicator vectors)
+        # optional locs
         e_locs = self._load_field(mat, self.e_key, required=False)
         i_locs = self._load_field(mat, self.i_key, required=False)
 
@@ -99,74 +101,23 @@ class SpikeGraphDataset(Dataset):
         assert adj.ndim == 2 and adj.shape[0] == adj.shape[1], \
             f"Expected square adjacency, got {adj.shape}"
 
-        N = adj.shape[0]        
-
-        e_ind = self._norm_indicator(e_locs, N)
-        i_ind = self._norm_indicator(i_locs, N)
-
-        # ----- build node_types: 0 = excitatory, 1 = inhibitory -----
-        types = np.zeros(N, dtype=np.int64)  # default all excitatory
-
-        if i_ind is not None:
-            # inhib = 1 where i_locs > 0.5
-            types = (i_ind > 0.5).astype(np.int64)
-        elif e_ind is not None:
-            # excitatory 1 → type 0, inhibitory 0 → type 1
-            types = (e_ind <= 0.5).astype(np.int64)
-        # else: leave all zeros (all excitatory, no E/I info in file)
-
         events_t = torch.from_numpy(events.astype(np.float32))
         adj_t = torch.from_numpy(adj.astype(np.float32))
 
         out = {
             "events": events_t,
             "adjacency": adj_t,
-            "node_types": torch.from_numpy(types),  # [N], long
         }
 
         if mf_params is not None:
             out["mf_params"] = torch.from_numpy(mf_params.astype(np.float32))
 
-        # keep raw indicator vectors too, if you want them
-        if e_ind is not None:
-            out["e_locs"] = torch.from_numpy(e_ind.astype(np.float32))  # [N]
-        if i_ind is not None:
-            out["i_locs"] = torch.from_numpy(i_ind.astype(np.float32))  # [N]
+        if e_locs is not None:
+            out["e_locs"] = torch.from_numpy(e_locs.astype(np.float32))
+        if i_locs is not None:
+            out["i_locs"] = torch.from_numpy(i_locs.astype(np.float32))
 
         return out
-    
-    # ----- normalize e_locs / i_locs to [N] indicator vectors -----
-    def _norm_indicator(x, N):
-        if x is None:
-            return None
-        x = np.asarray(x).astype(np.float32)
-        x = x.reshape(-1)          # [N] or checkable
-        if x.shape[0] != N:
-            raise ValueError(f"Expected indicator length {N}, got {x.shape}")
-        return x
-    
-    def _norm_indicator(self, arr, N: int) -> Optional[np.ndarray]:
-        """
-        Normalize MATLAB indicator vectors e_locs / i_locs.
-
-        In MATLAB:
-            i_locs: [N,1] with 1 for inhibitory, 0 otherwise
-            e_locs: [N,1] with 1 for excitatory, 0 otherwise
-
-        Here we:
-            - return None if arr is None
-            - flatten to shape [N]
-            - check length
-        """
-        if arr is None:
-            return None
-
-        arr = np.asarray(arr).astype(np.float32).reshape(-1)
-        if arr.shape[0] != N:
-            raise ValueError(
-                f"Expected indicator of length {N}, got {arr.shape}"
-            )
-        return arr
 
 def spike_graph_collate(batch: list) -> dict:
     """Collate function for SpikeGraphDataset."""
@@ -174,23 +125,12 @@ def spike_graph_collate(batch: list) -> dict:
     batch_idx_list = []
     adj_list = []
     params_list = []
-    types_list = []
-    e_locs_list = []
-    i_locs_list = []
 
     for i, sample in enumerate(batch):
         events = sample["events"]
         events_list.append(events)
         batch_idx_list.append(torch.full((events.shape[0],), i, dtype=torch.long))
         adj_list.append(sample["adjacency"])
-
-        if "node_types" in sample:
-            types_list.append(sample["node_types"])       # [N]
-
-        if "e_locs" in sample:
-            e_locs_list.append(sample["e_locs"])         # [N]
-        if "i_locs" in sample:
-            i_locs_list.append(sample["i_locs"])         # [N]
 
         if "mf_params" in sample:
             params_list.append(sample["mf_params"])
@@ -201,16 +141,9 @@ def spike_graph_collate(batch: list) -> dict:
         "adjacency": torch.stack(adj_list, dim=0),
     }
 
-    if types_list:
-        out["node_types"] = torch.stack(types_list, dim=0)  # [B, N]
-
-    if e_locs_list:
-        out["e_locs"] = torch.stack(e_locs_list, dim=0)     # [B, N]
-    if i_locs_list:
-        out["i_locs"] = torch.stack(i_locs_list, dim=0)     # [B, N]
-
     # ----------------------------------------------------------------------
     # Handle variable-length parameter vectors.
+    # We pad to the max length _in this batch_ and record the true lengths.
     # ----------------------------------------------------------------------
     if params_list:
         lengths = torch.tensor(
@@ -246,6 +179,7 @@ def create_dataloader(
         pin_memory=True,
         **kwargs,
     )
+
 
 def build_loaders(
     data_dir: str,

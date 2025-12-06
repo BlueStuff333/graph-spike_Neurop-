@@ -20,37 +20,59 @@ mkdir(fullfile('networks', batchstamp, 'test'));
 % K = 5, M = 2, R = 3, l_i [(0.1, 0.9), (0.3, 0.7), (0.5, 0.5), (0.7, 0.3), (0.9, 0.1)], p_ij(r) same
 % R = 1:4
 %% generate n graph-spiking pairs
-n_graphs = 200; % num graphs to make
+n_graphs = 1000; % num graphs to make
 train_test = 0.8;
 n_zeros = ceil(log10(n_graphs));
 isDirected = 1; isBinary = 0;
 % adj_lists = cell(n_graphs, 1);    % These cause memory issues for large n_graphs
 % firings_list = cell(n_graphs, 1); % TODO develop a separate pipeline for visualization from saved .mat files
-P0 = [0.8 0.5; 0.5 0.4]; % use a base probability matrix and apply noisy perturbations
+% randomized P0 bound values [0.2, 0.8]
+P0 = 0.1 + 0.6 * rand(2,2);
 noise_level = 0.1;
+lb = 0.15;             % lower bound per entry
+total_mass = 1;        % sum of all 4 entries
+free_mass = total_mass - 4 * lb; % mass left to distribute after lower bounds
+
 densities = cell(n_graphs, 1);
 tic
 parfor i = 1:n_graphs
     % randomize parameters
-    n = 500 + randi([-100, 100]); % num neurons to generate
+    n = 200 %+ randi([-100, 100]); % num neurons to generate
     r = 0.8; % proportion of neurons that are E
     Ne = floor(0.8*n); Ni = n-Ne;
     i_scaling = 3; % how much stronger than excitation we want inhibition to be
 
     %% multifractal parameters
-    R = randi(2); % resolution, prefer lower R for sparser graphs
+    R = randi(3); % resolution
     % build p_ij matrices
     P = zeros(2,2,R);
     for r_idx = 1:R
-        P(:,:,r_idx) = P0 + noise_level*(rand(2,2) - 0.5);
-        P(:,:,r_idx) = min(max(P(:,:,r_idx), 0.1), 0.9); % clamp
+        % start near P0 with noise
+        P_raw = P0 + noise_level * (rand(2,2) - 0.5);
+
+        % flatten to 4-vector
+        p = P_raw(:);
+
+        % enforce lower bound first
+        p = max(p, lb);  % each entry >= 0.1
+
+        % project (p - lb) onto simplex of sum free_mass (0.6)
+        p_shift = p - lb;
+        p_shift = max(p_shift, 0);  % numerical safety
+        p_proj = project_to_simplex(p_shift, free_mass);
+
+        % shift back: now entries sum to 1 and are >= lb
+        p_final = lb + p_proj;
+
+        % reshape back to 2x2
+        P(:,:,r_idx) = reshape(p_final, 2, 2);
     end
     % P = repmat(P, 1, 1, R);
     % randomize side length
     l1 = 0.2 + 0.6 * rand(); % [0.2, 0.8]
     L = [l1, 1-l1];
     M = length(L); 
-    K = randi([3,4]); % prefer higher K for sparser graphs
+    K = randi([1,4]);
 
     % generate the graph
     PK = calcPK_weighted(M, K, P);
@@ -100,7 +122,7 @@ parfor i = 1:n_graphs
     disp(['N: ', num2str(n), ', K: ', num2str(K), ', M: ', num2str(M), ', R: ', num2str(R)]);
     disp(['L: ', num2str(L)]);
 end
-disp(sprintf('Graph spike gen time: %.2f', toc));
+fprintf('Graph spike gen time: %.2f\n', toc);
 avg_density = mean(cell2mat(densities));
 disp(['Average density: ', num2str(avg_density)]);
 
@@ -116,3 +138,27 @@ disp(['Average density: ', num2str(avg_density)]);
 % end
 
 disp('complete');
+
+function x = project_to_simplex(v, z)
+%PROJECT_TO_SIMPLEX Project v onto {x >= 0, sum(x) = z}.
+% v: column vector
+% z: desired sum (default 1)
+
+    if nargin < 2
+        z = 1;
+    end
+
+    v = v(:);
+    n = numel(v);
+
+    % Sort in descending order
+    [u, ~] = sort(v, 'descend');
+    cssv = cumsum(u);
+
+    % Find rho
+    rho = find(u + (z - cssv) ./ (1:n)' > 0, 1, 'last');
+    theta = (cssv(rho) - z) / rho;
+
+    w = max(v - theta, 0);
+    x = w;  % already column vector with sum(x) = z
+end

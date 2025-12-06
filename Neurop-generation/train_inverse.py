@@ -141,14 +141,14 @@ class GraphReconstructionLoss(nn.Module):
         losses = {}
         
         # 1. Binary connectivity loss
-        # bce_raw = self.bce(pred['adjacency'], target['adjacency'])
-        bce_raw = binary_focal_loss_with_logits(
-            pred['adjacency'],
-            target['adjacency'],
-            alpha=0.55,
-            gamma=2.5,
-            reduction='none'
-        )
+        bce_raw = self.bce(pred['adjacency'], target['adjacency'])
+        # bce_raw = binary_focal_loss_with_logits(
+        #     pred['adjacency'],
+        #     target['adjacency'],
+        #     alpha=0.65,
+        #     gamma=0.5,
+        #     reduction='none'
+        # )
         # There are no self-connections; mask out diagonal
         batch, n, _ = bce_raw.shape
         eye = torch.eye(n, device=bce_raw.device).unsqueeze(0)  # [1, n, n]
@@ -158,16 +158,16 @@ class GraphReconstructionLoss(nn.Module):
         target_adj = target['adjacency'] * mask
         
         # estimate positive fractions in this batch
-        # with torch.no_grad():
-        #     pos_frac = target_adj.mean().clamp(min=1e-4, max=1-1e-4)
-        #     # approx inverse-frequency weighting
-        #     pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
-        #     pos_weight = torch.clamp(pos_weight, min=1.0, max=3.0)  # limit extreme weights
+        with torch.no_grad():
+            pos_frac = target_adj.mean().clamp(min=1e-4, max=1-1e-4)
+            # approx inverse-frequency weighting
+            pos_weight = (1.0 - pos_frac) / pos_frac # e.g. if pos_frac=0.1, pos_weight~9.0
+            pos_weight = torch.clamp(pos_weight, min=1.0, max=5.0)  # limit extreme weights
 
-        # weights = torch.ones_like(bce_raw)
-        # weights[target_adj ==1] = pos_weight
-        # adj_loss = (bce_raw * weights).sum() / weights.sum()
-        adj_loss = bce_raw.mean()
+        weights = torch.ones_like(bce_raw)
+        weights[target_adj ==1] = pos_weight
+        adj_loss = (bce_raw * weights).sum() / weights.sum()
+        # adj_loss = bce_raw.mean()
         losses['adjacency'] = adj_loss.item()
 
         # 2. Weight loss (only for existing connections)
@@ -313,7 +313,7 @@ def train_epoch(model,
 
         if edge_mask_prob > 0.0:
             # mask edges with probability p
-            edge_mask = (torch.rand_like(true_adj_binary) > args.edge_mask_prob).float()
+            edge_mask = (torch.rand_like(true_adj_binary) > edge_mask_prob).float()
 
             # apply mask to target adjacency
             true_adj_binary_masked = true_adj_binary * edge_mask
@@ -683,7 +683,7 @@ if __name__ == "__main__":
     # Model parameters
     parser.add_argument('--n_neurons', type=int, default=1125)
     parser.add_argument('--n_timesteps_full', type=int, default=10000)
-    parser.add_argument('--temporal_downsampling', type=int, default=50) # TODO test diff values e.g. 100
+    parser.add_argument('--temporal_downsampling', type=int, default=1) # TODO test diff values e.g. 100
     parser.add_argument('--n_timesteps', type=int, default=1000)  # After downsampling
     parser.add_argument('--embedding_dim', type=int, default=64)
     parser.add_argument('--grid_size', type=int, default=64)
@@ -693,7 +693,7 @@ if __name__ == "__main__":
                         help='Max resolution levels for WMGM parameters '
                         '(1 less than dimension, 0 indexed)')
     parser.add_argument('--base', type=str, default='legendre')
-    parser.add_argument('--predict_positions', action='store_true',
+    parser.add_argument('--predict_positions', action=False,
                         help='Also predict neuron positions')
     parser.add_argument('--bce_weight', type=float, default=1.0,
                         help='Weight for BCE loss term')

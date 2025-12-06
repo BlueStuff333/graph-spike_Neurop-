@@ -75,8 +75,12 @@ def compute_legendre_filters(k: int):
     Q, R = linalg.qr(H_stack, mode='full')
     
     # Wavelet filters are the orthogonal complement
-    G0 = Q[k:, :k].T  # (k, k)
-    G1 = Q[:k, k:2*k].T if Q.shape[1] > k else np.zeros((k, k))
+    # Columns k..2k-1 are the orthogonal complement of col(H_stack)
+    Q0 = Q[:k, :]      # top k rows
+    Q1 = Q[k:, :]      # bottom k rows
+
+    G0 = Q0[:, k:2*k].T   # shape (k, k)
+    G1 = Q1[:, k:2*k].T   # shape (k, k)
     
     # Correction terms Sigma for reconstruction (identity for uniform measure)
     Sigma0 = np.eye(k)
@@ -137,8 +141,12 @@ def compute_chebyshev_filters(k: int):
     H_stack = np.vstack([H0, H1])
     Q, R = linalg.qr(H_stack, mode='full')
     
-    G0 = Q[k:, :k].T
-    G1 = Q[:k, k:2*k].T if Q.shape[1] > k else np.zeros((k, k))
+    # Columns k..2k-1 are the orthogonal complement of col(H_stack)
+    Q0 = Q[:k, :]      # top k rows
+    Q1 = Q[k:, :]      # bottom k rows
+
+    G0 = Q0[:, k:2*k].T   # shape (k, k)
+    G1 = Q1[:, k:2*k].T   # shape (k, k)
     
     # Correction terms (non-identity for Chebyshev)
     Sigma0 = np.eye(k) * 1.1  # Approximate - full version in paper

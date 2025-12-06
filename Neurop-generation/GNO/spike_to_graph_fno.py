@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.fft as fft
 import torch.nn.functional as F
 
-from typing import Optional
-
 import math
 
 class SpikeEncoder(nn.Module):
@@ -64,163 +62,49 @@ class SpikeEncoder(nn.Module):
 
 class TemporalFourierOperator1D(nn.Module):
     """
-    FNO-style operator over *time only* with a residual local MLP.
+    FNO-style operator over *time only*.
 
     Input:  spikes [B, N, T]
     Output: E      [B, N, d_model]  node embeddings
-
-    E_out = post_mlp(FourierMix(spikes)) + local_mlp(mean_t(spikes))
     """
     def __init__(self, n_modes: int, d_model: int):
         super().__init__()
         self.n_modes = n_modes
         self.d_model = d_model
 
-        # Complex spectral weights for the first n_modes
         self.weight_real = nn.Parameter(torch.randn(n_modes, d_model) * 0.01)
         self.weight_imag = nn.Parameter(torch.randn(n_modes, d_model) * 0.01)
 
-        # Nonlinearity on the spectral features
         self.post_mlp = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_model),
         )
 
-        # Local residual MLP: operates on a scalar per node
-        # (mean firing rate over time) and lifts it to d_model dims.
-        self.local_mlp = nn.Sequential(
-            nn.Linear(1, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
-        )
+    def forward(self, spikes):
+        # B, N, T = spikes.shape
 
-    def forward(self, spikes: torch.Tensor) -> torch.Tensor:
-        """
-        spikes: [B, N, T]
-        """
-        # -------------------------
-        # Spectral (Fourier) path
-        # -------------------------
         x_f = fft.rfft(spikes, dim=-1)          # [B, N, K]
-        x_f = x_f[..., : self.n_modes]          # keep first n_modes
+        x_f = x_f[..., :self.n_modes]
         K = x_f.shape[-1]
 
         x_real, x_imag = x_f.real, x_f.imag     # [B, N, K]
 
-        W_r = self.weight_real[:K]              # [K, d_model]
-        W_i = self.weight_imag[:K]              # [K, d_model]
+        W_r = self.weight_real[:K]             # [K, d_model]
+        W_i = self.weight_imag[:K]
 
-        a = x_real.unsqueeze(-1)                # [B, N, K, 1]
+        a = x_real.unsqueeze(-1)               # [B, N, K, 1]
         b = x_imag.unsqueeze(-1)
-        c = W_r.unsqueeze(0).unsqueeze(0)       # [1, 1, K, d_model]
+        c = W_r.unsqueeze(0).unsqueeze(0)      # [1, 1, K, d_model]
         d = W_i.unsqueeze(0).unsqueeze(0)
 
-        y_real = a * c - b * d                  # [B, N, K, d_model]
-        y_imag = a * d + b * c                  # [B, N, K, d_model]
+        y_real = a * c - b * d                 # [B, N, K, d_model]
+        y_imag = a * d + b * c
 
-        # Magnitude and aggregate over modes
-        y_mag = torch.sqrt(y_real**2 + y_imag**2 + 1e-8)
-        E_fourier = y_mag.mean(dim=2)           # [B, N, d_model]
+        y_mag = torch.sqrt(y_real ** 2 + y_imag ** 2 + 1e-8)
+        E = y_mag.mean(dim=2)                  # [B, N, d_model]
 
-        spectral_out = self.post_mlp(E_fourier) # [B, N, d_model]
-
-        # -------------------------
-        # Local residual path
-        # -------------------------
-        # Simple local summary: mean firing over time per neuron
-        local_in = spikes.mean(dim=-1, keepdim=True)   # [B, N, 1]
-        local_out = self.local_mlp(local_in)           # [B, N, d_model]
-
-        # FNO-style residual: spectral + local
-        return spectral_out + local_out                # [B, N, d_model]
-    
-class TemporalFNO1D(nn.Module):
-    """
-    1D Fourier Neural Operator layer along time, à la Li et al.
-
-    spikes [B, N, T]  (per neuron time series)
-      → FFT over time
-      → linear transform on first n_modes in Fourier space
-      → inverse FFT back to time domain  (K(v))
-      → add local Wv term in time domain
-      → activation σ
-      → pool over time → node embedding [B, N, d_model]
-    """
-
-    def __init__(
-        self,
-        seq_len: int,
-        d_model: int,
-        n_modes: int = 32,
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        self.n_modes = n_modes
-        self.in_channels = 1
-        self.out_channels = d_model
-
-        # Complex weights for low Fourier modes: [C_in, C_out, n_modes]
-        self.weight = nn.Parameter(
-            torch.randn(self.in_channels, self.out_channels, n_modes, dtype=torch.cfloat)
-            * 0.01
-        )
-
-        # Local Wv term: 1x1 conv in time domain (acts per neuron independently)
-        self.w = nn.Conv1d(self.in_channels, self.out_channels, kernel_size=1)
-
-        self.act = nn.GELU()
-        # Optional projection (kept for symmetry, but out_channels == d_model)
-        self.proj = nn.Linear(self.out_channels, d_model)
-
-    def forward(self, spikes: torch.Tensor) -> torch.Tensor:
-        """
-        spikes: [B, N, T]
-        returns: [B, N, d_model]
-        """
-        B, N, T = spikes.shape
-        device = spikes.device
-
-        # Treat each neuron separately: [B*N, 1, T]
-        x = spikes.view(B * N, 1, T)
-
-        # -------- Spectral path: K(v) --------
-        x_f = torch.fft.rfft(x, dim=-1)          # [B*N, 1, K]
-        K = x_f.size(-1)
-        m = min(self.n_modes, K)
-
-        # Low modes only
-        x_f_low = x_f[..., :m]                   # [B*N, 1, m]
-        W = self.weight[..., :m]                 # [1, C_out, m]
-
-        # Broadcast: [B*N, 1, m] * [1, C_out, m] → [B*N, C_out, m]
-        y_f_low = x_f_low * W
-
-        # Zero-pad back to full spectrum for each output channel
-        y_f = torch.zeros(
-            B * N,
-            self.out_channels,
-            K,
-            dtype=torch.cfloat,
-            device=device,
-        )
-        y_f[..., :m] = y_f_low
-
-        # Inverse FFT back to time domain: K(v)
-        kx = torch.fft.irfft(y_f, n=T, dim=-1)   # [B*N, C_out, T]
-
-        # -------- Local path: Wv --------
-        wx = self.w(x)                           # [B*N, C_out, T]
-
-        # -------- Combine and activate --------
-        y = self.act(kx + wx)                    # [B*N, C_out, T]
-
-        # Pool over time to get node embeddings
-        # (mean over T; you could also use max / last)
-        E = y.mean(dim=-1)                       # [B*N, C_out]
-
-        E = self.proj(E)                         # [B*N, d_model]
-        return E.view(B, N, -1)                  # [B, N, d_model]
+        return self.post_mlp(E)                # [B, N, d_model]
     
 class EdgeFourierCoeffNet(nn.Module):
     """
@@ -260,36 +144,19 @@ class EdgeFourierCoeffNet(nn.Module):
 
 class NodeFeatureNet(nn.Module):
     """
-    High-dimensional residual MLP per node.
-
-    Input : X [B, N, d_in]
-    Output: H [B, N, d_out]
-
-    H = act( W2 act(W1 X) + W_skip X )
+    Simple per-node MLP: E [B, N, d_in] → H [B, N, d_out]
     """
     def __init__(self, d_in: int, d_hidden: int, d_out: int):
         super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, d_hidden),
+            nn.ReLU(),
+            nn.Linear(d_hidden, d_out),
+            nn.ReLU(),
+        )
 
-        # High-dimensional MLP branch
-        self.fc1 = nn.Linear(d_in, d_hidden)
-        self.fc2 = nn.Linear(d_hidden, d_out)
-
-        # Skip/projection so residual works even if d_in != d_out
-        self.skip = nn.Linear(d_in, d_out)
-
-        self.act = nn.GELU()
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # MLP branch
-        h = self.act(self.fc1(X))      # [B, N, d_hidden]
-        h = self.fc2(h)                # [B, N, d_out]
-
-        # Residual projection branch
-        r = self.skip(X)               # [B, N, d_out]
-
-        # Residual combine + nonlinearity
-        out = self.act(h + r)          # [B, N, d_out]
-        return out
+    def forward(self, E):
+        return self.net(E)   # [B, N, d_out]
     
 class AdjacencyLinearDecoder2D(nn.Module):
     """
@@ -333,7 +200,7 @@ class SpikeToGraphFNO2D(nn.Module):
     """
     spikes [B, N, T] →
     Temporal FNO (time) →
-    per-node NN (augmented with E/I type) →
+    per-node NN →
     edge Fourier coeffs →
     2D iFFT →
     linear matrix →
@@ -347,35 +214,22 @@ class SpikeToGraphFNO2D(nn.Module):
         n_modes_time: int = 32,
         node_hidden: int = 128,
         edge_hidden: int = 256,
-        type_dim: int = 8,   # dimension of E/I type embedding
     ):
         super().__init__()
         self.n_neurons = n_neurons
         self.seq_len = seq_len
-        self.type_dim = type_dim
 
-        # Temporal FNO over spikes
-        # self.temporal_op = TemporalFourierOperator1D(
-        #     n_modes=n_modes_time,
-        #     d_model=d_model,
-        # )
-        self.temporal_op = TemporalFNO1D(
-            seq_len=seq_len,
-            d_model=d_model,
+        self.temporal_op = TemporalFourierOperator1D(
             n_modes=n_modes_time,
+            d_model=d_model,
         )
 
-        # E/I type embedding: 0 = excitatory, 1 = inhibitory
-        self.type_emb = nn.Embedding(2, type_dim)
-
-        # Node MLP now takes [d_model + type_dim] as input
         self.node_net = NodeFeatureNet(
-            d_in=d_model + type_dim,
+            d_in=d_model,
             d_hidden=node_hidden,
             d_out=d_model,
         )
 
-        # Edge coeff network + 2D decoder as before
         self.coeff_net = EdgeFourierCoeffNet(
             d_model=d_model,
             hidden_dim=edge_hidden,
@@ -385,37 +239,13 @@ class SpikeToGraphFNO2D(nn.Module):
             n_neurons=n_neurons,
         )
 
-    def forward(
-        self,
-        spikes: torch.Tensor,
-        node_types: Optional[torch.Tensor] = None,
-    ):
-        """
-        spikes:      [B, N, T]
-        e_locs:      excitatory indicator(s), shape [N], [N,1], [B,N] or [B,N,1]
-        i_locs:      inhibitory indicator(s), same allowed shapes as e_locs
-        node_types:  [B, N] (0=E,1=I); if provided, overrides e_locs/i_locs
-        """
-        B, N, T = spikes.shape
-        device = spikes.device
-
-        # Build node_types if not provided
-        node_types = node_types.to(device)
-
-        # Temporal FNO to get per-node embeddings
-        E = self.temporal_op(spikes)                 # [B, N, d_model]
-
-        # Embed E/I type and concatenate as extra features
-        type_feat = self.type_emb(node_types)        # [B, N, type_dim]
-        E_aug = torch.cat([E, type_feat], dim=-1)    # [B, N, d_model + type_dim]
-
-        # Node MLP + edge coeffs + 2D iFFT decoder
-        H = self.node_net(E_aug)                     # [B, N, d_model]
-        coeffs = self.coeff_net(H)                   # [B, N, N] complex
-        out = self.adj_decoder(coeffs)               # dict: adj_logits / adj_prob
-
+    def forward(self, spikes):
+        # spikes: [B, N, T]
+        E = self.temporal_op(spikes)           # [B, N, d_model]
+        H = self.node_net(E)                   # [B, N, d_model]
+        coeffs = self.coeff_net(H)             # [B, N, N] complex
+        out = self.adj_decoder(coeffs)         # dict with adj_logits / adj_prob
         return out
-
 
 class GraphDecoder(nn.Module):
     """
@@ -423,14 +253,10 @@ class GraphDecoder(nn.Module):
 
     E: [B, N, d_model]
     """
-    def __init__(self, d_model: int, hidden_dim: int = 256, type_dim: int = 8):
+    def __init__(self, d_model: int, hidden_dim: int = 256):
         super().__init__()
         self.source_proj = nn.Linear(d_model, hidden_dim)
         self.target_proj = nn.Linear(d_model, hidden_dim)
-        self.type_emb = nn.Embedding(2, type_dim)
-
-        self.source_proj = nn.Linear(d_model + type_dim, hidden_dim)
-        self.target_proj = nn.Linear(d_model + type_dim, hidden_dim)
 
         self.edge_mlp = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
@@ -447,16 +273,11 @@ class GraphDecoder(nn.Module):
             nn.Softplus(),
         )
 
-    def forward(self, E, node_types):
-        # B, N, D = E.shape
-        # h_s = self.source_proj(E)
-        # h_t = self.target_proj(E)
-        type_feat = self.type_emb(node_types)  # [B, N, type_dim]
-        E_aug = torch.cat([E, type_feat], dim=-1)  # [B, N, d_model + type_dim]
-        B, N, D = E_aug.shape
+    def forward(self, E):
+        B, N, D = E.shape
 
-        h_s = self.source_proj(E_aug)
-        h_t = self.target_proj(E_aug)
+        h_s = self.source_proj(E)
+        h_t = self.target_proj(E)
 
         h_s_exp = h_s.unsqueeze(2).expand(B, N, N, -1)
         h_t_exp = h_t.unsqueeze(1).expand(B, N, N, -1)
@@ -473,60 +294,36 @@ class GraphDecoder(nn.Module):
         }
 
 class SpikeToGraph1D(nn.Module):
-    def __init__(self, n_neurons: int, seq_len: int,
-                 d_model: int = 128, n_modes_time: int = 32, type_dim: int = 8):
+    def __init__(self, n_neurons: int, seq_len: int, d_model: int = 128, n_modes_time: int = 32):
         super().__init__()
         self.n_neurons = n_neurons
         self.seq_len = seq_len
 
-        self.temporal_op = TemporalFNO1D(
-            seq_len=seq_len,
-            d_model=d_model,
+        self.temporal_op = TemporalFourierOperator1D(
             n_modes=n_modes_time,
+            d_model=d_model,
         )
-        self.decoder = GraphDecoder(d_model=d_model, hidden_dim=256, type_dim=type_dim)
 
-    def forward(self, spikes, node_types):
-        E = self.temporal_op(spikes)        # FNO over time → [B, N, d_model]
-        out = self.decoder(E, node_types)   # pairwise MLP → adjacency
+        self.decoder = GraphDecoder(d_model=d_model, hidden_dim=256)
+
+    def forward(self, spikes):
+        """
+        spikes: [B, N, T]
+        """
+        E = self.temporal_op(spikes)
+        out = self.decoder(E)
         return out
 
 class BinaryAdjacencyLoss(nn.Module):
-    def __init__(self, pos_weight: float = None, binarize_target: bool = True):
+    def __init__(self, pos_weight: float = None):
         super().__init__()
-        self.binarize_target = binarize_target
-
         if pos_weight is not None:
-            # We'll move this tensor onto the correct device in forward()
-            self.register_buffer("pos_weight", torch.tensor(float(pos_weight)))
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
         else:
-            self.pos_weight = None
-        # if pos_weight is not None:
-        #     self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
-        # else:
-        #     self.bce = nn.BCEWithLogitsLoss()
+            self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, adj_logits, adj_true):
-        """
-        adj_logits: [B, N, N] raw logits
-        adj_true:   [B, N, N] weighted adjacency (>= 0)
-
-        We:
-        - binarize target: edge present if weight > 0
-        - apply BCEWithLogitsLoss with optional pos_weight
-        """
-        if self.binarize_target:
-            target = (adj_true > 0).float()
-        else:
-            target = adj_true
-
-        if self.pos_weight is not None:
-            pos_w = self.pos_weight.to(adj_logits.device)
-            bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)
-        else:
-            bce = nn.BCEWithLogitsLoss()
-
-        return bce(adj_logits, target)
+        return self.bce(adj_logits, adj_true)
 
 if __name__ == "__main__":
     # Quick test

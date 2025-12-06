@@ -1,3 +1,5 @@
-Neurop-generation/__pycache__/*
 graph-spike-generation/networks/**/*.mat
 graph-spike-generation/networks/**/**/*
+__pycache__/
+checkpoints/
+*.pt

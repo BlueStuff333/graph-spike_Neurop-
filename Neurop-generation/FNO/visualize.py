@@ -2,10 +2,8 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Optional
 
 from evaluate import evaluate_dataset, save_results, print_results
-
 
 def load_checkpoint(
     checkpoint_path: str,
@@ -17,7 +15,6 @@ def load_checkpoint(
     model.to(device)
     model.eval()
     return model
-
 
 def plot_adjacency_comparison(
     A_true: np.ndarray,
@@ -36,7 +33,6 @@ def plot_adjacency_comparison(
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
-
 
 def plot_spectral_comparison(
     A_true: np.ndarray,
@@ -64,7 +60,6 @@ def plot_spectral_comparison(
     plt.savefig(save_path, dpi=150)
     plt.close()
 
-
 def plot_spike_raster(
     events: np.ndarray,
     save_path: str,
@@ -76,7 +71,6 @@ def plot_spike_raster(
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
-
 
 def run_visualization(
     model: torch.nn.Module,
